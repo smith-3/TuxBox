@@ -318,14 +318,19 @@ pub(super) fn lower(insns: &mut [Insn], first: usize) -> Result<(u32, usize), &'
     Ok((width, start + last_read + 2))
 }
 
-// Restrict the proof to a small straight-line scalar slice. No lane reads,
-// EXEC/VCC values, memory operations or unrecognized definitions are admitted.
+// Restrict the proof to a small straight-line scalar slice. Only literals and
+// the final broadcast from the previous verified reduction can supply its inputs.
 // The caller checks all control-flow edges crossing this entire slice.
-fn uniform_scalar_chain(insns: &[Insn], end: usize, operand: Opnd) -> Option<usize> {
+fn uniform_scalar_chain(insns: &[Insn], end: usize, operand: Opnd, previous_read: Option<usize>) -> Option<usize> {
     use std::collections::BTreeSet;
     let Opnd::Sgpr(reg @ 0..=105) = operand else { return None };
     let mut needed = BTreeSet::from([reg]);
+    let end = insns[..end].iter().rposition(|i| !matches!(i.mnemonic.as_str(), "s_nop" | "s_waitcnt"))? + 1;
     for index in (end.saturating_sub(32)..end).rev() {
+        if let Some(read) = previous_read.filter(|&read| read + 1 == index) {
+            let [Opnd::Sgpr(result)] = insns[read].dst[..] else { return None };
+            return (needed.len() == 1 && needed.contains(&result)).then_some(read);
+        }
         let ins = &insns[index];
         if matches!(ins.mnemonic.as_str(), "s_nop" | "s_waitcnt") { continue; }
         let [Opnd::Sgpr(dst @ 0..=105)] = ins.dst.as_slice() else { return None };
@@ -394,31 +399,21 @@ fn uniform_forward_guard(
     }
 
     // A final READ_LANE of an already checked reduction broadcasts the same
-    // scalar to every host invocation. No intervening writes are permitted.
+    // scalar to every host invocation. Its EXEC restore marks the end of that reduction.
     let previous_read = verified_reads.last().copied().filter(|&read| {
         read + 1 < compare_index
             && insns[read].op == READ_LANE
             && insns[read].enc == Enc::Vop3
             && insns[read + 1].mnemonic.starts_with("s_mov_b")
             && insns[read + 1].dst == [Opnd::ExecLo]
-            && insns[read + 2..compare_index].iter().all(|i| {
-                matches!(i.mnemonic.as_str(), "s_nop" | "s_waitcnt")
-            })
     });
     let mut proof_start = compare.offset as i64;
     for src in &compare.src {
         match src {
             Opnd::ConstInt(_) | Opnd::Literal(_) => (),
             Opnd::Sgpr(_) => {
-                if let Some(read) = previous_read.filter(|&read| insns[read].dst.as_slice() == [*src]) {
-                    proof_start = proof_start.min(insns[read].offset as i64);
-                } else {
-                    // A contiguous straight-line chain of ordinary scalar moves
-                    // and integer operations is uniform if all of its dependencies
-                    // are literals or previously established uniform definitions.
-                    let Some(first) = uniform_scalar_chain(insns, compare_index, *src) else { return false };
-                    proof_start = proof_start.min(insns[first].offset as i64);
-                }
+                let Some(first) = uniform_scalar_chain(insns, compare_index, *src, previous_read) else { return false };
+                proof_start = proof_start.min(insns[first].offset as i64);
             }
             _ => return false,
         }
@@ -992,6 +987,25 @@ mod tests {
             ex.isa_data = ex.isa.clone();
             let refusal = super::super::translate(&ex).err().unwrap();
             assert!(refusal.contains("divergent control flow"), "{refusal}");
+        }
+    }
+
+    #[test]
+    fn guard_can_derive_its_scalar_from_a_verified_reduction() {
+        for width in [32, 64] {
+            let (mut ex, mut words, cmp) = fixture::shader(width);
+            // Copy the first reduction result and add 1 before comparing with zero.
+            words.splice(cmp..cmp, [0xbe89_0307, 0x8007_8109]);
+            for (add, accepted) in [(0x8007_8109, true), (0x8007_0809, false)] {
+                // Adding an unproven s8 alongside the copy of s7 must still fail.
+                words[cmp + 1] = add;
+                ex.isa = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+                ex.isa_data = ex.isa.clone();
+                match super::super::translate(&ex) {
+                    Ok(_) => assert!(accepted),
+                    Err(reason) => assert!(!accepted && reason.contains("divergent control flow"), "{reason}"),
+                }
+            }
         }
     }
 

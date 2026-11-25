@@ -73,6 +73,7 @@ def cases(width=32):
     yield "zero_sum", full, [0] * width
     yield "wrap_zero", full, [0x40000000] * 4 + [0] * (width - 4)
     yield "wrap_nonzero", full, [0x7fffffff] * width
+    yield "sum_minus_one", 7, [0x7fffffff, 0x7fffffff, 1] + [0] * (width - 3)
     yield "lane_zero", 1, [17] * width
     if width == 64:
         yield "upper_half", 0xffffffff00000000, list(range(width))
@@ -88,8 +89,9 @@ def seed_and_expected(mask, values, mode="all", variant="original"):
     active = [(mask >> lane) & 1 for lane in range(width)]
     seed[96:96 + width] = [v | (a << 31) for v, a in zip(values, active)]
     total = sum(v for v, a in zip(values, active) if a) & 0xffffffff
-    skip = total == 0 if variant == "original" else variant == "chain-zero"
-    second = 0 if skip and variant == "chain-zero" else total if skip else (total + sum(active)) & 0xffffffff
+    guard_value = {"original": total, "chain": 2, "chain-zero": 0, "result-chain": (total + 1) & 0xffffffff}[variant]
+    skip = guard_value == 0
+    second = guard_value if skip else (total + sum(active)) & 0xffffffff
     expected = seed.copy()
     if mode == "all":
         assert width == 32
@@ -110,7 +112,7 @@ def main():
         parser.add_argument("--" + name, type=Path, required=True)
     parser.add_argument("--adapter", required=True)
     parser.add_argument("--width", type=int, choices=(32, 64), default=32)
-    parser.add_argument("--variant", choices=("original", "chain", "chain-zero"), default="original")
+    parser.add_argument("--variant", choices=("original", "chain", "chain-zero", "result-chain"), default="original")
     args = parser.parse_args()
     work = args.work.resolve()
     work.mkdir(parents=True, exist_ok=True)

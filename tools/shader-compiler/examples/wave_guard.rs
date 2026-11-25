@@ -19,6 +19,10 @@ fn main() {
             // s_mov_b32 s9, 0; s_add_u32 s7, s9, 0.
             words.splice(cmp..cmp, [0xbe89_0380, 0x8007_8009]);
         }
+        Some("result-chain") => {
+            // s_mov_b32 s9, s7; s_add_u32 s7, s9, 1.
+            words.splice(cmp..cmp, [0xbe89_0307, 0x8007_8109]);
+        }
         _ => (),
     }
     shader.isa = words.iter().flat_map(|word| word.to_le_bytes()).collect();
