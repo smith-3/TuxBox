@@ -272,7 +272,7 @@ pub(super) unsafe extern "system" fn copy_buffer(
     bytes: u64,
 ) {
     let super::CommandRecording { list, state } = &mut *recording(list);
-    if !state.can_record(&list.native) {
+    if !state.ensure_open(&list.native) {
         return;
     }
     let owner = parent(&list.parent);
@@ -287,11 +287,11 @@ pub(super) unsafe extern "system" fn copy_buffer(
         state.error = E_INVALIDARG;
         return;
     };
-    // SAFETY: both native buffers belong to the list and contain the requested range.
-    unsafe {
-        list.native
-            .CopyBufferRegion(&dst.native, dst_offset, &src.native, src_offset, bytes)
-    };
+    if let Err(error) = state.prefix.copy_buffer(
+        &list.native, &dst.native, dst_offset, &src.native, src_offset, bytes,
+    ) {
+        state.error = error.code();
+    }
 }
 
 #[cfg(test)]

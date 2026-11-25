@@ -1,5 +1,5 @@
 //! Translate waits on host-visible Series fence words at a native list boundary.
-//! The game can write markers and sample timestamps before waiting. Keep these
+//! The game can copy buffers, write markers and sample timestamps before waiting. Keep these
 //! prefix operations ordered without disturbing bindings on the main command list.
 use super::*;
 use std::sync::atomic::{AtomicI32, AtomicU64};
@@ -9,6 +9,13 @@ use windows::Win32::Foundation::HANDLE;
 use windows::core::Result;
 
 pub(super) enum Packet {
+    CopyBuffer {
+        dst: ID3D12Resource,
+        dst_offset: u64,
+        src: ID3D12Resource,
+        src_offset: u64,
+        bytes: u64,
+    },
     Marker(D3D12_WRITEBUFFERIMMEDIATE_PARAMETER),
     Timestamp(ID3D12QueryHeap, u32, ID3D12Resource, u64),
 }
@@ -17,6 +24,9 @@ impl Packet {
     fn emit(&self, list: &ID3D12GraphicsCommandList) -> Result<()> {
         unsafe {
             match self {
+                Self::CopyBuffer { dst, dst_offset, src, src_offset, bytes } => {
+                    list.CopyBufferRegion(dst, *dst_offset, src, *src_offset, *bytes);
+                }
                 Self::Marker(write) => {
                     // Marker-out lands after the preceding work, as the
                     // bottom-of-pipe write it stands for does.
@@ -57,6 +67,22 @@ impl Prefix {
         }
         self.pending.try_reserve(1).map_err(|_| E_OUTOFMEMORY)?;
         self.pending.push(packet);
+        Ok(())
+    }
+
+    pub(super) fn copy_buffer(
+        &mut self, list: &ID3D12GraphicsCommandList,
+        dst: &ID3D12Resource, dst_offset: u64, src: &ID3D12Resource, src_offset: u64, bytes: u64,
+    ) -> Result<()> {
+        // Leading direct-list copies need no graphics bindings. Keep them with
+        // the prefix so a later wait can submit them before holding the queue.
+        if !self.in_body && unsafe { list.GetType() } == D3D12_COMMAND_LIST_TYPE_DIRECT {
+            return self.push(list, Packet::CopyBuffer {
+                dst: dst.clone(), dst_offset, src: src.clone(), src_offset, bytes,
+            });
+        }
+        self.finish(list)?;
+        unsafe { list.CopyBufferRegion(dst, dst_offset, src, src_offset, bytes) };
         Ok(())
     }
 
