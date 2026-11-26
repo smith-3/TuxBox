@@ -31,6 +31,21 @@ float tb_mull(float a, float b) { return (a == 0.0 || b == 0.0) ? 0.0 : a * b; }
 uint tb_f16_cvt(float x, bool rtz) { uint u = asuint(x); uint s = (u >> 16) & 0x8000u; uint a = u & 0x7fffffffu; if (a > 0x7f800000u) return s | 0x7e00u | ((a >> 13) & 0x3ffu); if (a == 0x7f800000u) return s | 0x7c00u; if (rtz) { if (a >= 0x477fe000u) return s | 0x7bffu; } else { if (a >= 0x477ff000u) return s | 0x7c00u; } if (a >= 0x38800000u) { uint r = (a >> 13) - 0x1c000u; uint rem = a & 0x1fffu; if (!rtz && (rem > 0x1000u || (rem == 0x1000u && (r & 1u) != 0u))) r += 1u; return s | r; } if (a < 0x33000000u) return s; uint e = a >> 23; uint mant = (a & 0x7fffffu) | 0x800000u; uint sh = 126u - e; uint q = mant >> sh; uint rem = mant & ((1u << sh) - 1u); uint half = 1u << (sh - 1u); if (!rtz && (rem > half || (rem == half && (q & 1u) != 0u))) q += 1u; return s | q; }
 "#;
 
+// Differentiate tb_cube_dir with its face held fixed. The unit major
+// component has zero derivative and the local S/T axes retain their signs.
+pub(in crate::hlsl) const CUBE_GRADIENT: &str = r#"
+float3 tb_cube_grad(float2 grad, float face) {
+    float u = 2.0 * grad.x, v = 2.0 * grad.y;
+    int f = (int)round(face);
+    if (f == 0) return float3(0.0, -v, -u);
+    if (f == 1) return float3(0.0, -v, u);
+    if (f == 2) return float3(u, 0.0, v);
+    if (f == 3) return float3(u, 0.0, -v);
+    if (f == 4) return float3(u, -v, 0.0);
+    return float3(-u, -v, 0.0);
+}
+"#;
+
 pub(in crate::hlsl) const MAD24_SAT: &str = r#"
 uint tb_mad24_sat(uint a, uint b, uint acc, bool isSigned) {
     a = isSigned ? asuint(asint(a << 8) >> 8) : (a & 0xffffffu);

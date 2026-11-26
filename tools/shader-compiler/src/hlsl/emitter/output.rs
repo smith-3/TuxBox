@@ -4,6 +4,9 @@ use super::*;
 impl<'a> Emitter<'a> {
     pub(in crate::hlsl) fn push_helpers(&self, h: &mut String) {
         h.push_str(CUBE_HELPERS);
+        if self.body.contains("tb_cube_grad(") {
+            h.push_str(CUBE_GRADIENT);
+        }
         if self.insns.iter().any(clamped_product24) {
             h.push_str(MAD24_SAT);
         }

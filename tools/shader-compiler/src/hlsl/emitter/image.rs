@@ -357,12 +357,15 @@ impl<'a> Emitter<'a> {
             return Err("unsupported image op".into());
         }
         let (modi, cmp, has_off) = (op & 7, op & 8 != 0, op & 0x10 != 0);
+        let cube_grad = dim == 3 && matches!(op, 0x22 | 0x23) && !a16 && !d16;
         // (coordinate count, derivative components, offset components)
         let (ncoord, nder, noff) = match dim {
             0 => (1usize, 1usize, 1usize),
             1 => (2, 2, 2),
             2 => (3, 3, 3),
-            3 => (3, 3, 0),
+            // Cube gradients are two projected derivatives per axis. The face
+            // is a separate address component and has no derivative.
+            3 => (3, if cube_grad { 2 } else { 3 }, 0),
             4 => (2, 1, 1),
             5 => (3, 2, 2),
             _ => return Err(format!("image dim {dim} unsupported")),
@@ -669,7 +672,13 @@ impl<'a> Emitter<'a> {
                 0 | 1 => format!("{tex}.Sample({smp}, {cvec}{})", tail(&offset, &clamp)?),
                 2 | 3 => {
                     let (dx, dy) = grads.clone().ok_or("missing gradients")?;
-                    format!("{tex}.SampleGrad({smp}, {cvec}, {dx}, {dy}{})", tail(&offset, &clamp)?)
+                    if cube_grad {
+                        let face = &coords[2];
+                        let min_lod = clamp.as_ref().map_or_else(String::new, |c| format!(", {c}"));
+                        format!("{tex}.SampleGrad({smp}, {cvec}, tb_cube_grad({dx}, {face}), tb_cube_grad({dy}, {face}){min_lod})")
+                    } else {
+                        format!("{tex}.SampleGrad({smp}, {cvec}, {dx}, {dy}{})", tail(&offset, &clamp)?)
+                    }
                 }
                 4 => format!("{tex}.SampleLevel({smp}, {cvec}, {}{})", lod.clone().ok_or("missing lod")?, tail(&offset, &None)?),
                 5 | 6 => format!("{tex}.SampleBias({smp}, {cvec}, {}{})", bias.clone().ok_or("missing bias")?, tail(&offset, &clamp)?),
