@@ -50,6 +50,7 @@ The launcher sets these for a Proton or Wine launch. A value you set yourself is
 | `TUXBOX_PIPELINE_MAX_LIVE` | one per CPU core, 2 to 16 | Background pipeline compiles at once, 1 to 16 |
 | `TUXBOX_PIPELINE_MAX_QUEUED` | `64` | Background compiles waiting for a slot, 1 to 4096; past it pipeline creation waits |
 | `TUXBOX_MESH_COMPILES` | off | Native mesh pipelines created at once |
+| `TUXBOX_MESH_LAZY` | off | `1` creates mesh pipelines when a command list first binds them |
 | `TUXBOX_NULL_PIPELINES` | on | `0` fails unsupported pipelines instead of giving empty stand-ins |
 | `TUXBOX_PROGRESS_OVERLAY` | `auto` | `always` or `0` for the progress panel |
 | `TUXBOX_PROGRESS_OVERLAY_POS` | `tr` | `tl`, `tr`, `bl` or `br` |

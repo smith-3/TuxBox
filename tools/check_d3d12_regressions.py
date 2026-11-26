@@ -33,10 +33,11 @@ CASES = {
     "buffer-unmap-alive": ("d3d12-buffer-import", ("--unmap-alive",), "d3d12-buffer-unmap", ("mode=alive",)),
     "buffer-unmap-released": ("d3d12-buffer-import", ("--unmap-released",), "d3d12-buffer-unmap", ("mode=released", "later-submits=ok")),
     "mesh-pso": ("d3d12-mesh-pso", (), "d3d12-mesh-pso", ("jobs=4", "pipelines=12", "drawn=12", "pixels=768/768", "guards=96")),
+    "mesh-pso-lazy": ("d3d12-mesh-pso", (), "d3d12-mesh-pso", ("jobs=4", "pipelines=12", "drawn=4", "pixels=768/768", "guards=96")),
     "null-usage": ("d3d12-null-usage", (), "d3d12-null-usage", ("words=64/64", "recorded=64", "valid=2")),
     "null-disabled": ("d3d12-null-usage", ("--reject",), "d3d12-null-disabled", ("rejected=1", "valid=1")),
 }
-DEFAULT = tuple(name for name in CASES if name not in ("root-cbv-window", "alias-deferred", "copy-resource", "indirect-scarlett", "mesh", "mesh-pso", "buffer-import", "buffer-import-reject", "buffer-layout", "buffer-remap", "buffer-unmap-alive", "buffer-unmap-released"))
+DEFAULT = tuple(name for name in CASES if name not in ("root-cbv-window", "alias-deferred", "copy-resource", "indirect-scarlett", "mesh", "mesh-pso", "mesh-pso-lazy", "buffer-import", "buffer-import-reject", "buffer-layout", "buffer-remap", "buffer-unmap-alive", "buffer-unmap-released"))
 DIGEST = hashlib.sha256(bytes.fromhex("78563412efcdab90")).hexdigest()
 
 
@@ -70,6 +71,13 @@ def validate(case, adapter, status, output):
         # A compatibility control must exercise the real pipeline, not a
         # successful no-op substitution (even if its output happens to match).
         if fallback or any("TuxBox d3d12_xs: null usage rank " in line for line in lines):
+            return False, passes[0]
+    lazy = re.findall(r"mesh lazy deferred=([0-9]+) materialized=([0-9]+) failed=([0-9]+)", output)
+    if case == "mesh-pso" and lazy:
+        return False, passes[0]
+    if case == "mesh-pso-lazy":
+        # Every pipeline is deferred, and only the drawn ones are created.
+        if not lazy or lazy[-1] != ("12", "4", "0") or any(int(created) > 4 for _, created, _ in lazy):
             return False, passes[0]
     if case in ("buffer-import","buffer-import-reject"):
         # Proton may insert another diagnostic between the provider prefix
@@ -195,6 +203,8 @@ def main(argv=None):
                  "TUXBOX_TRACE_BUFFER_BACKING":"1" if case.startswith("buffer-") or case=="root-cbv-window" else "0"}
             if case.startswith("mesh-pso"):
                 env["TUXBOX_MESH_PSO_TEST_JOBS"]="4"
+            if case=="mesh-pso-lazy":
+                env.update(TUXBOX_MESH_LAZY="1",TUXBOX_MESH_PSO_TEST_DRAWN="4")
             cmd=["bwrap","--die-with-parent","--unshare-pid","--unshare-net","--ro-bind","/","/",
                  "--dev-bind","/dev","/dev","--proc","/proc","--tmpfs","/tmp","--bind",str(trial),str(trial),
                  "--unsetenv","WAYLAND_DISPLAY","--chdir",str(trial)]

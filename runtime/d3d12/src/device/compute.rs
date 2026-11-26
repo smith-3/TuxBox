@@ -33,6 +33,9 @@ pub(crate) struct PipelineData {
     /// A driver compile that outlived creation. Until it finishes, the proxy
     /// holds a resource-free stand-in with the same root signature.
     pub(crate) pending: Option<crate::big_stack::Pending<windows::core::Result<ID3D12PipelineState>>>,
+    /// A mesh pipeline created on first bind. The proxy wraps a shared
+    /// placeholder until then (see `mesh_lazy`).
+    pub(crate) lazy: Option<super::mesh_lazy::LazyMesh>,
 }
 
 impl Pipeline {
@@ -40,6 +43,15 @@ impl Pipeline {
     /// creation is waited for here, when the title first uses the pipeline.
     /// A compile that failed leaves the stand-in, as a failed create does.
     pub(crate) fn bound_native(&self) -> ID3D12PipelineState {
+        if let Some(lazy) = &self.state.lazy {
+            if let Some(native) = lazy.native() {
+                return native;
+            }
+            static UNBOUND: std::sync::Once = std::sync::Once::new();
+            crate::diagnostics::log_once(&UNBOUND, || {
+                "a lazy mesh pipeline has neither its pipeline nor a stand-in; binding the placeholder".into()
+            });
+        }
         match self.state.pending.as_ref().and_then(crate::big_stack::Pending::wait) {
             Some(Ok(native)) => native,
             _ => self.native.clone(),
@@ -71,9 +83,47 @@ const _: () = assert!(
 // read off the end, so those calls fail closed.
 pub(super) static PIPELINE: Slots<14> = {
     let mut slots = child_slots::<ID3D12PipelineState, PipelineData, 14>();
+    slots[3] = crate::slot!(get_private);
+    slots[4] = crate::slot!(set_private);
+    slots[5] = crate::slot!(set_private_interface);
     slots[11] = crate::slot!(scratch_info);
     slots
 };
+
+// A lazy mesh pipeline wraps a placeholder that other pipelines share, so it
+// keeps private data itself. Every other pipeline forwards to its native one.
+unsafe extern "system" fn get_private(this: &Pipeline, key: *const GUID, size: *mut u32, data: *mut c_void) -> HRESULT {
+    let Some(key) = (unsafe { key.as_ref() }) else { return E_INVALIDARG };
+    match &this.state.lazy {
+        Some(lazy) => unsafe { lazy.private.get(key, size, data) },
+        None => {
+            let native: &ID3D12Object = (&this.native).into();
+            unsafe { (native.vtable().GetPrivateData)(native.as_raw(), key, size, data) }
+        }
+    }
+}
+
+unsafe extern "system" fn set_private(this: &Pipeline, key: *const GUID, size: u32, data: *const c_void) -> HRESULT {
+    let Some(key) = (unsafe { key.as_ref() }) else { return E_INVALIDARG };
+    match &this.state.lazy {
+        Some(lazy) => unsafe { lazy.private.set(key, size, data) },
+        None => {
+            let native: &ID3D12Object = (&this.native).into();
+            unsafe { (native.vtable().SetPrivateData)(native.as_raw(), key, size, data) }
+        }
+    }
+}
+
+unsafe extern "system" fn set_private_interface(this: &Pipeline, key: *const GUID, object: *mut c_void) -> HRESULT {
+    let Some(key) = (unsafe { key.as_ref() }) else { return E_INVALIDARG };
+    match &this.state.lazy {
+        Some(lazy) => unsafe { lazy.private.set_interface(key, object) },
+        None => {
+            let native: &ID3D12Object = (&this.native).into();
+            unsafe { (native.vtable().SetPrivateDataInterface)(native.as_raw(), key, object) }
+        }
+    }
+}
 
 // FidelityFX queries a blob for the console pipeline's scratch size. Desktop
 // pipelines manage their own scratch. The caller skips the blob on failure.

@@ -39,6 +39,8 @@ pub(super) struct DxgiDevice {
     pub(super) depth_views: std::sync::Arc<super::placement::Views<super::stencil::Surface>>,
     pub(super) disposal: std::sync::Mutex<Option<(super::DisposeCallback, usize)>>,
     pub(super) frames: super::frame_events::FrameEvents,
+    /// What lazy mesh pipelines wrap until first bind (see `mesh_lazy`).
+    pub(super) mesh_placeholder: OnceLock<Option<windows::Win32::Graphics::Direct3D12::ID3D12PipelineState>>,
 }
 
 const _: () =
@@ -74,6 +76,7 @@ impl DxgiDevice {
             host: Default::default(),
             depth_views: Default::default(),
             frames: Default::default(),
+            mesh_placeholder: OnceLock::new(),
             disposal: Default::default(),
             blas: Default::default(),
             media: Default::default(),

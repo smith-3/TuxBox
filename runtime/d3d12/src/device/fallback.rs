@@ -37,6 +37,28 @@ pub(super) fn shader(stage: Stage) -> Option<&'static [u8]> {
     CODE[index].get_or_init(|| compile(source, profile)).as_deref()
 }
 
+/// DXIL for a resource-free mesh and pixel pair, compiled once with DXC. The
+/// mesh stage emits one vertex and no primitives, so its draws touch nothing.
+/// Mesh pipelines need Shader Model 6 for every stage, which D3DCompile lacks.
+pub(super) fn null_mesh() -> Option<&'static (std::sync::Arc<[u8]>, std::sync::Arc<[u8]>)> {
+    const SOURCE: &str = r#"
+struct Vertex { float4 position : SV_Position; };
+[numthreads(1, 1, 1)]
+[outputtopology("triangle")]
+void mesh(out vertices Vertex verts[1], out indices uint3 faces[1]) {
+    SetMeshOutputCounts(1, 0);
+    verts[0].position = float4(0, 0, 0, 1);
+}
+void pixel() { }
+"#;
+    static CODE: OnceLock<Option<(std::sync::Arc<[u8]>, std::sync::Arc<[u8]>)>> = OnceLock::new();
+    CODE.get_or_init(|| {
+        let mesh = super::dxc::compile(SOURCE, w!("ms_6_5"), w!("mesh"), "null mesh").ok()?;
+        let pixel = super::dxc::compile(SOURCE, w!("ps_6_5"), w!("pixel"), "null mesh").ok()?;
+        Some((mesh, pixel))
+    }).as_ref()
+}
+
 fn compile(source: &str, profile: windows::core::PCSTR) -> Option<Vec<u8>> {
     type Compile = unsafe extern "system" fn(
         *const core::ffi::c_void, usize, *const i8, *const core::ffi::c_void, *const core::ffi::c_void,

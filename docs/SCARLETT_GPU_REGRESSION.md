@@ -22,9 +22,12 @@ Optional `--case mesh` requires a mesh-capable device. The
 `--case indirect-scarlett` mode requires the companion ABI fixture from
 PR #87. An unsupported option or missing capability is a failure, not a pass.
 
-`--case mesh-pso` also needs a mesh-capable device. It creates twelve
-distinct mesh pipelines on four threads, draws through all of them, and checks
-768 words between 96 guards.
+`--case mesh-pso` and `--case mesh-pso-lazy` also need a mesh-capable
+device. Both create twelve distinct mesh pipelines on four threads and check
+768 words between 96 guards. `mesh-pso` draws through all twelve.
+`mesh-pso-lazy` sets `TUXBOX_MESH_LAZY=1` and draws through four, and passes
+only if all twelve were deferred, exactly four were created, and the eight
+undrawn ones left their words at zero.
 
 ## Forced null compute control
 

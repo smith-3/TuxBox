@@ -522,21 +522,26 @@ unsafe fn create(
         // A pair the driver rejects is retranslated against this pixel consumer.
         let relink = match (original[7], original[1], &hashes[1]) {
             (Some((mesh, Some(_))), Some((pixel, _)), Some((pixel_digest, _))) if !stream_output => {
-                Some(super::mesh_pipeline::Relink {
-                    mesh_guest: mesh.into(),
-                    root_payload: guest_root.map(|root| root.payload().into()),
-                    pixel_digest: pixel_digest.clone(),
-                    pixel_source: pixel.into(),
-                })
+                Some(super::mesh_pipeline::Relink::new(
+                    mesh, guest_root.map(|root| root.payload()), pixel_digest.clone(), pixel,
+                ))
             }
             _ => None,
         };
         // SAFETY: the stream storage, its field pointers, the translated
         // shaders, and the guest's root and stages are live for this call.
         let recipe = unsafe {
-            super::mesh_pipeline::MeshRecipe::capture(output, size, &fields, root_record, relink, hashes.clone(), label.clone())
+            super::mesh_pipeline::MeshRecipe::capture(output, size, &fields, root_record, seen, relink, hashes.clone(), label.clone())
         }
         .ok_or(E_INVALIDARG)?;
+        // A deferred pipeline is created when a command list first binds it.
+        if super::mesh_lazy::enabled()
+            && let Some(placeholder) = super::mesh_lazy::placeholder(device)
+            && let Some(lazy) = super::mesh_lazy::LazyMesh::defer(&recipe, host)
+        {
+            pipeline.lazy = Some(lazy);
+            return Ok(placeholder);
+        }
         let created = recipe.materialize(host);
         if created.is_err() {
             if let (Some(pixel), Some(root)) = (guest_pixel, guest_root) {
