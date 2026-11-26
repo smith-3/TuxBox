@@ -90,6 +90,124 @@ static HRESULT wait_status(Status *s, UINT i) {
   return s->GetHResult(i);
 }
 
+static void page_prefix(bool clipped, const wchar_t *input) {
+  std::vector<unsigned char> compressed = {
+      0x78, 0x9c, 0xed, 0xc1, 0x01, 0x0d, 0x00, 0x00,
+      0x00, 0xc2, 0xa0, 0x56, 0xef, 0x1f, 0xcd, 0x1c,
+      0x6e, 0x40, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00,
+      0x00, 0x00, 0xef, 0x06, 0xd4, 0x87, 0xc0, 0x5b};
+  if (input) {
+    std::ifstream file(input, std::ios::binary);
+    require(file.good(), "open compressed page fixture");
+    compressed.assign(std::istreambuf_iterator<char>(file), {});
+    require(!compressed.empty(), "nonempty compressed page fixture");
+  }
+  const wchar_t *path = L"xcrdapi-page-prefix.bin";
+  {
+    std::ofstream file(path, std::ios::binary | std::ios::trunc);
+    file.write(reinterpret_cast<const char *>(compressed.data()), compressed.size());
+    file.write(reinterpret_cast<const char *>(compressed.data()), compressed.size() - 1);
+    file.put(static_cast<char>(compressed.back() ^ 1));
+    require(file.good(), "write page fixture");
+  }
+
+  HMODULE xmem = LoadLibraryW(L"xmem.dll");
+  require(xmem != nullptr, "load xmem");
+  auto allocate = reinterpret_cast<BOOL (WINAPI *)(UINT64, SIZE_T *, UINT64 *)>(
+      GetProcAddress(xmem, "XMemAllocatePhysicalPages"));
+  auto map = reinterpret_cast<void *(WINAPI *)(void *, SIZE_T, const UINT64 *)>(
+      GetProcAddress(xmem, "XMemMapPhysicalPages"));
+  auto release = reinterpret_cast<BOOL (WINAPI *)(SIZE_T, const UINT64 *)>(
+      GetProcAddress(xmem, "XMemFreePhysicalPages"));
+  require(allocate && map && release, "physical page exports");
+  SIZE_T count = 1;
+  UINT64 token = 0;
+  require(allocate(0x20400000, &count, &token) && count == 1 && token,
+          "allocate physical page");
+  constexpr SIZE_T page_size = 65536;
+  constexpr SIZE_T start = 4096;
+  constexpr SIZE_T length = 4096;
+  auto page = static_cast<unsigned char *>(
+      VirtualAlloc(nullptr, page_size, MEM_RESERVE, PAGE_READWRITE));
+  require(page && map(page, 1, &token) == page, "map physical page");
+  std::fill_n(page, page_size, static_cast<unsigned char>(0xa5));
+
+  ComPtr<Factory> factory;
+  ComPtr<Queue> queue;
+  ComPtr<Status> status;
+  ComPtr<XFile> file;
+  QueueDesc desc{0, 0x80, 0, "Physical prefix"};
+  check(DStorageGetFactory(IID_PPV_ARGS(&factory)), "page factory");
+  check(factory->CreateQueue(&desc, IID_PPV_ARGS(&queue)), "page queue");
+  check(factory->CreateStatusArray(1, nullptr, IID_PPV_ARGS(&status)),
+        "page status");
+  check(factory->OpenFile(path, IID_PPV_ARGS(&file)), "open page fixture");
+  Request request{0x200001, &token, start, length, file.Get(),
+                  0, static_cast<UINT32>(compressed.size()), 0, 0, nullptr};
+  queue->EnqueueRequest(&request);
+  queue->EnqueueStatus(status.Get(), 0);
+  queue->Submit();
+  HRESULT result = wait_status(status.Get(), 0);
+  if (clipped)
+    check(result, "clipped physical zlib read");
+  else
+    require(FAILED(result), "strict physical zlib bounds");
+  require(std::all_of(page, page + start, [](unsigned v) { return v == 0xa5; }) &&
+              std::all_of(page + start + length, page + page_size,
+                          [](unsigned v) { return v == 0xa5; }) &&
+              std::all_of(page + start, page + start + length,
+                          [clipped](unsigned v) { return v == (clipped ? 0x36u : 0xa5u); }),
+          "physical output or guards");
+
+  std::fill_n(page, page_size, static_cast<unsigned char>(0xa5));
+  request.offset = compressed.size();
+  queue->EnqueueRequest(&request);
+  queue->EnqueueStatus(status.Get(), 0);
+  queue->Submit();
+  require(FAILED(wait_status(status.Get(), 0)) &&
+              std::all_of(page, page + page_size, [](unsigned v) { return v == 0xa5; }),
+          "reject corrupt physical block without writing a prefix");
+
+  if (clipped) {
+    // Title queues physical-page reads against its page table before mapping
+    // the physical page and calling Submit().
+    std::fill_n(page, page_size, static_cast<unsigned char>(0xa5));
+    UINT64 deferred_token = 0;
+    request.dest = &deferred_token;
+    request.offset = 0;
+    queue->EnqueueRequest(&request);
+    deferred_token = token;
+    queue->EnqueueStatus(status.Get(), 0);
+    queue->Submit();
+    check(wait_status(status.Get(), 0), "deferred physical page token");
+    require(std::all_of(page, page + start, [](unsigned v) { return v == 0xa5; }) &&
+                std::all_of(page + start + length, page + page_size,
+                            [](unsigned v) { return v == 0xa5; }) &&
+                std::all_of(page + start, page + start + length,
+                            [](unsigned v) { return v == 0x36u; }),
+            "deferred physical output or guards");
+
+    // A token that remains zero at execution time must still be rejected.
+    std::fill_n(page, page_size, static_cast<unsigned char>(0xa5));
+    deferred_token = 0;
+    queue->EnqueueRequest(&request);
+    queue->EnqueueStatus(status.Get(), 0);
+    queue->Submit();
+    require(wait_status(status.Get(), 0) == HRESULT_FROM_WIN32(ERROR_INVALID_ADDRESS) &&
+                std::all_of(page, page + page_size, [](unsigned v) { return v == 0xa5; }),
+            "reject unresolved zero physical page token");
+  }
+
+  queue->Close();
+  file.Reset();
+  require(DeleteFileW(path) != FALSE, "remove page fixture");
+  require(map(page, 1, nullptr) == page && release(1, &token) &&
+              VirtualFree(page, 0, MEM_RELEASE),
+          "release physical page");
+  std::puts(clipped ? "physical prefix=4096 guards=2 corrupt=rejected PASS"
+                    : "oversized physical output rejected guards=2 PASS");
+}
+
 static void run(int argc, wchar_t **argv) {
   require(argc == 1 || argc == 2 || argc == 5 || argc == 6,
           "expected [receipt] or source offset size oracle [receipt]");
@@ -264,6 +382,11 @@ static void run(int argc, wchar_t **argv) {
 
 int wmain(int argc, wchar_t **argv) {
   try {
+    if ((argc == 2 || argc == 3) && (!std::wcscmp(argv[1], L"--page-prefix") ||
+                                     !std::wcscmp(argv[1], L"--page-strict"))) {
+      page_prefix(!std::wcscmp(argv[1], L"--page-prefix"), argc == 3 ? argv[2] : nullptr);
+      return 0;
+    }
     run(argc, argv);
     constexpr auto result =
         "raw=16 zlib=16 guards=2 errors=2 cancellation=1 autosubmit=64 PASS";

@@ -89,6 +89,15 @@ impl Section {
         Ok(self.handle.get().unwrap().as_raw_handle())
     }
 
+    pub(super) fn bytes(&self) -> u64 {
+        self.bytes
+    }
+
+    /// Whether the pagefile section exists, and with it its committed bytes.
+    pub(super) fn materialized(&self) -> bool {
+        self.handle.get().is_some()
+    }
+
     pub(super) fn map(&self, offset: u64, address: usize) -> Result<(), u32> {
         self.map_range(offset, address, PAGE)
     }
