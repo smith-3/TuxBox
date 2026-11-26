@@ -1,4 +1,4 @@
-//! Bound how many large translated compute shaders the driver compiles at once.
+//! Bound concurrent host pipeline creation.
 //!
 //! The title creates pipelines on many threads. Translated compute programs of
 //! several hundred KiB take the driver minutes and on the order of a gigabyte
@@ -20,8 +20,18 @@ static LARGE: LazyLock<Gate> = LazyLock::new(|| {
     Gate::new(parse_slots(std::env::var("TUXBOX_LARGE_COMPILES").ok().as_deref()))
 });
 
+/// Native mesh creation has a separate limit, disabled unless explicitly set.
+static MESH: LazyLock<Option<Gate>> = LazyLock::new(|| {
+    mesh_gate(std::env::var("TUXBOX_MESH_COMPILES").ok().as_deref())
+});
+
 fn parse_slots(value: Option<&str>) -> usize {
     value.and_then(|text| text.trim().parse().ok()).unwrap_or(DEFAULT_SLOTS)
+}
+
+fn mesh_gate(value: Option<&str>) -> Option<Gate> {
+    let slots: std::num::NonZeroUsize = value?.trim().parse().ok()?;
+    Some(Gate::new(slots.get()))
 }
 
 pub(crate) struct Gate {
@@ -31,7 +41,7 @@ pub(crate) struct Gate {
     freed: Condvar,
 }
 
-/// One running large compile. Dropping it frees the slot.
+/// One running compile. Dropping it frees the slot.
 pub(crate) struct Slot<'a>(&'a Gate);
 
 impl Gate {
@@ -69,6 +79,11 @@ pub(crate) fn is_large(bytes: usize) -> bool {
 /// `None` and never wait.
 pub(crate) fn large_compile(bytes: usize, waiting: impl FnOnce(usize)) -> Option<Slot<'static>> {
     is_large(bytes).then(|| LARGE.acquire(waiting))
+}
+
+/// Acquire only for the native call, after preparing the mesh stream.
+pub(crate) fn mesh_compile() -> Option<Slot<'static>> {
+    MESH.as_ref().map(|gate| gate.acquire(|_| {}))
 }
 
 #[cfg(test)]

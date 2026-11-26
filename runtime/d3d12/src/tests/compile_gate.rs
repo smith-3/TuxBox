@@ -77,3 +77,26 @@ fn slot_count_comes_from_the_environment_value() {
     assert_eq!(parse_slots(Some("many")), DEFAULT_SLOTS);
     assert_eq!(parse_slots(Some("-1")), DEFAULT_SLOTS);
 }
+
+#[test]
+fn mesh_limit_requires_a_positive_slot_count() {
+    for value in [None, Some("0"), Some(""), Some("-1"), Some("many")] {
+        assert!(mesh_gate(value).is_none());
+    }
+    assert_eq!(peak(&mesh_gate(Some("1")).unwrap(), 4), 1);
+    assert_eq!(peak(&mesh_gate(Some(" 2 ")).unwrap(), 8), 2);
+}
+
+#[test]
+fn mesh_error_releases_its_slot_before_retry() {
+    let mesh = mesh_gate(Some("1")).unwrap();
+    let compute = Gate::new(1);
+    let create = || -> Result<(), &'static str> {
+        let _mesh_slot = mesh.acquire(|_| panic!("previous mesh call leaked its slot"));
+        let _compute_slot = compute.acquire(|_| panic!("mesh occupied a compute slot"));
+        Err("native creation failed")
+    };
+    assert_eq!(create(), Err("native creation failed"));
+    let _compute_slot = compute.acquire(|_| panic!("compute slot was not released"));
+    let _mesh_retry = mesh.acquire(|_| panic!("failed mesh call did not permit retry"));
+}

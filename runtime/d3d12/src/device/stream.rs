@@ -74,6 +74,36 @@ fn stream_label(original: &[Option<(&[u8], Option<usize>)>; 8]) -> String {
     if label.is_empty() { "stream".to_string() } else { label }
 }
 
+fn create_native_mesh(
+    host: &ID3D12Device2,
+    desc: &D3D12_PIPELINE_STATE_STREAM_DESC,
+    label: &str,
+) -> windows::core::Result<ID3D12PipelineState> {
+    use std::{sync::LazyLock, time::Instant};
+    static CLOCK: LazyLock<Option<Instant>> = LazyLock::new(|| {
+        (std::env::var_os("TUXBOX_TRACE_MESH_PSO").as_deref() == Some(std::ffi::OsStr::new("1")))
+            .then(Instant::now)
+    });
+    let clock = CLOCK.as_ref();
+    let arrival = clock.map(Instant::elapsed);
+    let slot = crate::compile_gate::mesh_compile();
+    let start = clock.map(Instant::elapsed);
+    // SAFETY: The caller keeps the stream and every borrowed subobject live
+    // through the synchronous native call, including the helper thread's join.
+    let result = crate::big_stack::run_logged(label, || unsafe { host.CreatePipelineState(desc) });
+    let end = clock.map(Instant::elapsed);
+    let gated = slot.is_some();
+    drop(slot);
+    if let (Some(arrival), Some(start), Some(end)) = (arrival, start, end) {
+        let hr = result.as_ref().err().map_or(0, |error| error.code().0 as u32);
+        crate::diagnostics::log(&format!(
+            "mesh native PSO {label} gated={} arrival_ns={} start_ns={} end_ns={} hr={hr:08x}",
+            u8::from(gated), arrival.as_nanos(), start.as_nanos(), end.as_nanos()
+        ));
+    }
+    result
+}
+
 unsafe fn create(
     device: &Device,
     desc: &D3D12_PIPELINE_STATE_STREAM_DESC,
@@ -509,6 +539,8 @@ unsafe fn create(
                 .unwrap_or_else(|| Err(E_NOTIMPL.into()));
             }
         }
+    } else if fields[7].is_some() {
+        create_native_mesh(host, &native_desc, &label)
     } else {
         // SAFETY: the stream storage, translated shaders, and guest-owned inputs
         // all stay alive throughout this synchronous call on the desktop Device2.
@@ -643,7 +675,7 @@ unsafe fn create(
                         BytecodeLength: linked.len(),
                     })
                 };
-                let retry = crate::big_stack::run_logged(&format!("linked {label}"), || unsafe { host.CreatePipelineState(&native_desc) });
+                let retry = create_native_mesh(host, &native_desc, &format!("linked {label}"));
                 match &retry {
                     Ok(_) => {
                         static MESH: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
