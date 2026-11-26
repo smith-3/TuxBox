@@ -58,12 +58,18 @@ unsafe fn equivalent_stencil(payload: *const u8, depth: &D3D12_DEPTH_STENCIL_DES
     unsafe { payload.cast::<[u8; 18]>().read_unaligned() == expected }
 }
 
-fn stream_label(original: &[Option<(&[u8], Option<usize>)>; 8]) -> String {
+/// The source digest of each stage, and whether it has a host translation.
+fn stage_hashes(original: &[Option<(&[u8], Option<usize>)>; 8]) -> [Option<(String, bool)>; 8] {
+    original.map(|stage| {
+        stage.and_then(|(code, prepared)| shader_cache::source_digest(code).map(|hash| (hash, prepared.is_some())))
+    })
+}
+
+fn stream_label(hashes: &[Option<(String, bool)>; 8]) -> String {
     const NAMES: [&str; 8] = ["VS", "PS", "DS", "HS", "GS", "CS", "AS", "MS"];
     let mut label = String::new();
-    for (name, stage) in NAMES.iter().zip(original) {
-        let Some((code, _)) = stage else { continue };
-        let Some(hash) = shader_cache::source_digest(code) else { continue };
+    for (name, stage) in NAMES.iter().zip(hashes) {
+        let Some((hash, _)) = stage else { continue };
         if !label.is_empty() {
             label.push(' ');
         }
@@ -72,36 +78,6 @@ fn stream_label(original: &[Option<(&[u8], Option<usize>)>; 8]) -> String {
         label.push_str(&hash[..8]);
     }
     if label.is_empty() { "stream".to_string() } else { label }
-}
-
-fn create_native_mesh(
-    host: &ID3D12Device2,
-    desc: &D3D12_PIPELINE_STATE_STREAM_DESC,
-    label: &str,
-) -> windows::core::Result<ID3D12PipelineState> {
-    use std::{sync::LazyLock, time::Instant};
-    static CLOCK: LazyLock<Option<Instant>> = LazyLock::new(|| {
-        (std::env::var_os("TUXBOX_TRACE_MESH_PSO").as_deref() == Some(std::ffi::OsStr::new("1")))
-            .then(Instant::now)
-    });
-    let clock = CLOCK.as_ref();
-    let arrival = clock.map(Instant::elapsed);
-    let slot = crate::compile_gate::mesh_compile();
-    let start = clock.map(Instant::elapsed);
-    // SAFETY: The caller keeps the stream and every borrowed subobject live
-    // through the synchronous native call, including the helper thread's join.
-    let result = crate::big_stack::run_logged(label, || unsafe { host.CreatePipelineState(desc) });
-    let end = clock.map(Instant::elapsed);
-    let gated = slot.is_some();
-    drop(slot);
-    if let (Some(arrival), Some(start), Some(end)) = (arrival, start, end) {
-        let hr = result.as_ref().err().map_or(0, |error| error.code().0 as u32);
-        crate::diagnostics::log(&format!(
-            "mesh native PSO {label} gated={} arrival_ns={} start_ns={} end_ns={} hr={hr:08x}",
-            u8::from(gated), arrival.as_nanos(), start.as_nanos(), end.as_nanos()
-        ));
-    }
-    result
 }
 
 unsafe fn create(
@@ -407,6 +383,7 @@ unsafe fn create(
         // SAFETY: the field points into the stream storage, and `stages` outlives it.
         unsafe { field.write(rectangle::bytecode(&stages[index])) };
     }
+    let hashes = stage_hashes(&original);
     if let Some(cs_ptr) = fields[5] {
         // SAFETY: `fields[5]` points into `storage`, which stays live for this call.
         let cs = unsafe { &*cs_ptr };
@@ -416,11 +393,6 @@ unsafe fn create(
                 let guest_cs = original[5].map_or(code, |(guest, _)| guest);
                 crate::diagnostics::compute_wave_failure(guest_cs, &refusal.detail);
                 crate::failures::refusal("CS", &refusal.tag);
-                let hashes = original.map(|stage| {
-                    stage.and_then(|(bytes, prepared)| {
-                        shader_cache::source_digest(bytes).map(|hash| (hash, prepared.is_some()))
-                    })
-                });
                 let native_desc = D3D12_PIPELINE_STATE_STREAM_DESC {
                     SizeInBytes: size,
                     pPipelineStateSubobjectStream: output.cast(),
@@ -500,7 +472,7 @@ unsafe fn create(
         SizeInBytes: size,
         pPipelineStateSubobjectStream: output.cast(),
     };
-    let label = stream_label(&original);
+    let label = stream_label(&hashes);
     // A large translated compute program can compile for longer than any load
     // will wait. It runs on a detached, queued compile with a deadline; past
     // that the title gets a stand-in until a command list first binds it, as on
@@ -530,11 +502,6 @@ unsafe fn create(
         ) {
             crate::big_stack::PipelineWait::Ready(result) => result,
             crate::big_stack::PipelineWait::Deferred(pending) => {
-                let hashes = original.map(|stage| {
-                    stage.and_then(|(code, prepared)| {
-                        shader_cache::source_digest(code).map(|hash| (hash, prepared.is_some()))
-                    })
-                });
                 // SAFETY: the stream storage and its field pointers are still live.
                 return match unsafe {
                     null_pipeline(host, &native_desc, &fields, stream_output, geometry_record, pipeline, &hashes)
@@ -552,7 +519,33 @@ unsafe fn create(
             }
         }
     } else if fields[7].is_some() {
-        create_native_mesh(host, &native_desc, &label)
+        // A pair the driver rejects is retranslated against this pixel consumer.
+        let relink = match (original[7], original[1], &hashes[1]) {
+            (Some((mesh, Some(_))), Some((pixel, _)), Some((pixel_digest, _))) if !stream_output => {
+                Some(super::mesh_pipeline::Relink {
+                    mesh_guest: mesh.into(),
+                    root_payload: guest_root.map(|root| root.payload().into()),
+                    pixel_digest: pixel_digest.clone(),
+                    pixel_source: pixel.into(),
+                })
+            }
+            _ => None,
+        };
+        // SAFETY: the stream storage, its field pointers, the translated
+        // shaders, and the guest's root and stages are live for this call.
+        let recipe = unsafe {
+            super::mesh_pipeline::MeshRecipe::capture(output, size, &fields, root_record, relink, hashes.clone(), label.clone())
+        }
+        .ok_or(E_INVALIDARG)?;
+        let created = recipe.materialize(host);
+        if created.is_err() {
+            if let (Some(pixel), Some(root)) = (guest_pixel, guest_root) {
+                super::compute_table::capture_stage_root(pixel, root);
+            }
+            capture_failed_stages(&original, guest_root);
+            return created;
+        }
+        created
     } else {
         // SAFETY: the stream storage, translated shaders, and guest-owned inputs
         // all stay alive throughout this synchronous call on the desktop Device2.
@@ -587,13 +580,6 @@ unsafe fn create(
     if let (Some(pixel), Some(root)) = (guest_pixel, guest_root) {
         super::compute_table::capture_stage_root(pixel, root);
     }
-    // Do not hash normal successful submissions twice. The consumer layout
-    // only matters when the desktop driver rejects the ordinary stage pair.
-    let hashes = original.map(|stage| {
-        stage.and_then(|(code, prepared)| {
-            shader_cache::source_digest(code).map(|hash| (hash, prepared.is_some()))
-        })
-    });
     // Pixel inputs come from the last active raster stage. Geometry outputs
     // take precedence over vertex outputs, even in a stream that has both.
     let producer = if fields[4].is_some() { 4 } else { 0 };
@@ -665,46 +651,6 @@ unsafe fn create(
         if retry.is_ok() { return retry; }
         capture_failed_stages(&original, guest_root);
         return unsafe { null_pipeline(host, &native_desc, &fields, stream_output, geometry_record, pipeline, &hashes) }.unwrap_or(retry);
-    }
-    // Mesh pipelines: retranslate the mesh program against this exact pixel
-    // consumer's input layout, as the VS/GS path above does.
-    if status == E_INVALIDARG
-        && let (Some(mesh_field), Some((mesh_code, Some(mi))), Some((pixel_code, _)), Some((pixel, _))) =
-            (fields[7], original[7], original[1], &hashes[1])
-        && fields[6].is_none()
-        && !stream_output
-    {
-        let bound = pixel_bytecode();
-        if !bound.pShaderBytecode.is_null() && bound.BytecodeLength != 0
-            && bound.BytecodeLength <= 64 * 1024 * 1024
-        {
-            let consumer = unsafe { slice::from_raw_parts(bound.pShaderBytecode.cast::<u8>(), bound.BytecodeLength) };
-            let source = shader_cache::mesh_link_source(mesh_code, guest_root.map(|root| root.payload()));
-            if let Some(linked) = shader_cache::link_mesh(&source, (pixel, pixel_code), &stages[mi], consumer) {
-                unsafe {
-                    mesh_field.write(D3D12_SHADER_BYTECODE {
-                        pShaderBytecode: linked.as_ptr().cast(),
-                        BytecodeLength: linked.len(),
-                    })
-                };
-                let retry = create_native_mesh(host, &native_desc, &format!("linked {label}"));
-                match &retry {
-                    Ok(_) => {
-                        static MESH: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-                        let n = MESH.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        if n < 8 || n.is_power_of_two() {
-                            crate::diagnostics::log(&format!("linked slot 86 MS for PS={pixel} (#{})", n + 1));
-                        }
-                        return retry;
-                    }
-                    Err(error) => {
-                        capture_failed_stages(&original, guest_root);
-                        crate::diagnostics::pipeline_stages(&hashes, error.code().0, true)
-                    }
-                }
-                return retry;
-            }
-        }
     }
     capture_failed_stages(&original, guest_root);
     crate::diagnostics::pipeline_stages(&hashes, status.0, false);
