@@ -36,6 +36,7 @@ pub(crate) mod blas;
 pub(crate) mod compute;
 mod compute_scene;
 mod compute_table;
+mod dxc;
 mod mesh_pipeline;
 mod mesh_table;
 pub(crate) mod depth;

@@ -1,16 +1,11 @@
 //! Rasterize Xbox screen rectangles from three corners. The fourth corner is
 //! implicit, so forwarding the three vertices as a triangle loses half the tile.
-use core::{ffi::c_void, fmt::Write, ptr, slice};
+use core::{fmt::Write, slice};
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock, Mutex};
-use windows::Win32::Foundation::{E_INVALIDARG, E_NOTIMPL, FreeLibrary};
-use windows::Win32::Graphics::Direct3D::Dxc::*;
+use windows::Win32::Foundation::{E_INVALIDARG, E_NOTIMPL};
 use windows::Win32::Graphics::Direct3D12::*;
-use windows::Win32::System::LibraryLoader::{
-    GetProcAddress, LOAD_LIBRARY_SEARCH_APPLICATION_DIR, LOAD_LIBRARY_SEARCH_SYSTEM32,
-    LoadLibraryExW,
-};
-use windows::core::{GUID, HRESULT, Interface, Result, s, w};
+use windows::core::{Result, w};
 
 // Frosty's pipeline builder maps UE primitive 5 to the Xbox rectangle class at
 // RVA 0x57a27c3. The IA packet table at 0x71c0500 maps 0x11 to DI_PT_RECTLIST.
@@ -78,50 +73,6 @@ fn source(vertex: &[u8], primitive_id: bool) -> Result<String> {
     Ok(hlsl)
 }
 
-fn compile(hlsl: &str) -> Result<Arc<[u8]>> {
-    type Create = unsafe extern "system" fn(*const GUID, *const GUID, *mut *mut c_void) -> HRESULT;
-    // Keep DXC optional for applications that only submit desktop topologies.
-    // Both the compiler and all blobs are released before unloading the module.
-    let module = unsafe {
-        LoadLibraryExW(
-            w!("dxcompiler.dll"),
-            None,
-            LOAD_LIBRARY_SEARCH_APPLICATION_DIR | LOAD_LIBRARY_SEARCH_SYSTEM32,
-        ).inspect_err(|error| {
-            static FAILED: std::sync::Once = std::sync::Once::new();
-            crate::diagnostics::log_once(&FAILED, || format!(
-                "rectangle shader: dxcompiler.dll load failed {:#010x}; stage matching x64 dxcompiler.dll and dxil.dll",
-                error.code().0
-            ));
-        })?
-    };
-    let result = (|| unsafe {
-        let entry = GetProcAddress(module, s!("DxcCreateInstance")).ok_or(E_NOTIMPL)?;
-        let create: Create = core::mem::transmute(entry);
-        let mut raw = ptr::null_mut();
-        create(&CLSID_DxcCompiler, &IDxcCompiler3::IID, &mut raw).ok()?;
-        let compiler = IDxcCompiler3::from_raw(raw);
-        let source = DxcBuffer {
-            Ptr: hlsl.as_ptr().cast(),
-            Size: hlsl.len(),
-            Encoding: DXC_CP_UTF8.0,
-        };
-        let result: IDxcResult = compiler.Compile(
-            &source,
-            Some(&[w!("-T"), w!("gs_6_0"), w!("-E"), w!("main")]),
-            None,
-        )?;
-        result.GetStatus()?.ok()?;
-        let blob = result.GetResult()?;
-        Ok(Arc::from(slice::from_raw_parts(
-            blob.GetBufferPointer().cast::<u8>(),
-            blob.GetBufferSize(),
-        )))
-    })();
-    let _ = unsafe { FreeLibrary(module) };
-    result
-}
-
 // The caller owns each descriptor's storage and shader blob during PSO creation.
 unsafe fn shader_bytes(code: &D3D12_SHADER_BYTECODE) -> Result<&[u8]> {
     if code.BytecodeLength == 0 {
@@ -150,7 +101,7 @@ pub(super) unsafe fn geometry(
     if let Some(code) = cache.get(&hlsl) {
         return Ok(code.clone());
     }
-    let code = compile(&hlsl)?;
+    let code = super::dxc::compile(&hlsl, w!("gs_6_0"), w!("main"), "rectangle")?;
     if cache.len() < 256 {
         cache.insert(hlsl, code.clone());
     }
