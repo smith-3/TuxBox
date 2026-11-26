@@ -7,6 +7,11 @@ use std::thread::{self, JoinHandle};
 use windows::Win32::Graphics::Direct3D12::ID3D12Fence;
 use windows::Win32::System::Threading::{CreateEventW, ResetEvent, SetEvent};
 
+const PHYSICAL_PAGE_BYTES: usize = 64 * 1024;
+const SCARLETT_TILE_RUN_LIMIT: usize = 32 * 1024 * 1024;
+const ZLIB: u64 = 1;
+const TO_PAGES: u64 = 1 << 21;
+
 #[implement(IQueue2)]
 struct Queue {
     shared: Arc<Shared>,
@@ -49,12 +54,14 @@ enum Source {
 
 struct Read {
     source: Source,
-    /// Physical page tokens and the byte offset into the first page.
-    pages: Option<(Vec<u64>, usize)>,
+    /// Physical page count and byte offset into the first page; tokens are read
+    /// from `dest` at execution time under the DirectStorage lifetime contract.
+    pages: Option<(usize, usize)>,
     dest: usize,
     capacity: usize,
     size: usize,
     options: u64,
+    intermediate_size: u32,
     tag: u64,
     cancelled: bool,
 }
@@ -64,21 +71,18 @@ struct Read {
 unsafe fn capture(queue_type: u64, req: *const Request) -> Result<Read, HRESULT> {
     let req = unsafe { req.as_ref() }.ok_or(E_POINTER)?;
     const FROM_MEMORY: u64 = 1 << 22;
-    // Bit 21: the destination is an array of 64 KiB physical page tokens,
-    // written linearly from `page_offset` into the first page.
-    const TO_PAGES: u64 = 1 << 21;
-    if req.options & !(FROM_MEMORY | TO_PAGES | 1) != 0 {
+    if req.options & !(FROM_MEMORY | TO_PAGES | ZLIB) != 0 {
+        trace::unsupported(req.options);
         return Err(E_NOTIMPL);
     }
-    // Snapshot the page array now: the title may reuse it after enqueueing.
+    // Physical page tokens may be populated between EnqueueRequest and Submit.
     let pages = if req.options & TO_PAGES != 0 {
-        if req.destination.is_null() {
+        if req.destination.is_null() || !req.destination.cast::<u64>().is_aligned() {
             return Err(E_INVALIDARG);
         }
         let offset = usize::from(req.page_offset);
-        let count = (offset + req.destination_size as usize).div_ceil(65536);
-        let tokens = unsafe { core::slice::from_raw_parts(req.destination.cast::<u64>(), count) }.to_vec();
-        Some((tokens, offset))
+        let count = (offset + req.destination_size as usize).div_ceil(PHYSICAL_PAGE_BYTES);
+        Some((count, offset))
     } else {
         None
     };
@@ -108,6 +112,7 @@ unsafe fn capture(queue_type: u64, req: *const Request) -> Result<Read, HRESULT>
         capacity: req.destination_size as usize,
         size: req.size as usize,
         options: req.options,
+        intermediate_size: req.intermediate_size,
         tag: req.tag,
         cancelled: false,
     })
@@ -132,7 +137,56 @@ struct Overlapped {
     event: usize,
 }
 
+fn inflate_page_prefix(mut compressed: &[u8], capacity: usize) -> Result<(Vec<u8>, usize), HRESULT> {
+    use miniz_oxide::inflate::stream::{InflateState, inflate};
+    use miniz_oxide::{DataFormat, MZFlush, MZStatus};
+
+    let invalid = HRESULT::from_win32(ERROR_INVALID_DATA.0);
+    let mut state = InflateState::new_boxed(DataFormat::Zlib);
+    let mut prefix = vec![0; capacity];
+    let mut discarded = [0; 16 * 1024];
+    let mut decoded = 0;
+    loop {
+        let output = if decoded < capacity {
+            &mut prefix[decoded..]
+        } else {
+            &mut discarded
+        };
+        let step = inflate(&mut state, compressed, output, MZFlush::None);
+        let status = step.status.map_err(|_| invalid)?;
+        compressed = &compressed[step.bytes_consumed..];
+        decoded += step.bytes_written;
+        if decoded > SCARLETT_TILE_RUN_LIMIT {
+            return Err(invalid);
+        }
+        if status == MZStatus::StreamEnd {
+            prefix.truncate(decoded);
+            return Ok((prefix, decoded));
+        }
+        if step.bytes_consumed == 0 && step.bytes_written == 0 {
+            return Err(invalid);
+        }
+    }
+}
+
 impl Read {
+    fn allows_clipped_zlib(&self) -> bool {
+        static SCARLETT_PREFIX: OnceLock<bool> = OnceLock::new();
+        let clipped_page = self.pages.is_some_and(|(count, offset)| {
+            count == 1
+                && offset.is_multiple_of(4096)
+                && self.capacity.is_multiple_of(4096)
+                && self.capacity < PHYSICAL_PAGE_BYTES
+        });
+        // Project Scarlett can ask for a prefix of a compressed tile run.
+        self.options == (TO_PAGES | ZLIB)
+            && self.intermediate_size == 0
+            && clipped_page
+            && *SCARLETT_PREFIX.get_or_init(|| {
+                std::env::var_os("TUXBOX_SCARLETT_STORAGE_PREFIX").is_some_and(|v| v == "1")
+            })
+    }
+
     fn execute(&self) -> Result<(), HRESULT> {
         if self.cancelled {
             return Ok(());
@@ -206,8 +260,16 @@ impl Read {
                 stats.pending_decodes += 1;
                 stats.total_decodes = stats.total_decodes.saturating_add(1);
             }
-            let output =
-                miniz_oxide::inflate::decompress_to_vec_zlib_with_limit(compressed, self.capacity);
+            let output = if self.allows_clipped_zlib() {
+                inflate_page_prefix(compressed, self.capacity)
+            } else {
+                miniz_oxide::inflate::decompress_to_vec_zlib_with_limit(compressed, self.capacity)
+                    .map(|bytes| {
+                        let decoded = bytes.len();
+                        (bytes, decoded)
+                    })
+                    .map_err(|_| HRESULT::from_win32(ERROR_INVALID_DATA.0))
+            };
             {
                 let mut stats = storage_stats();
                 stats.pending_decodes -= 1;
@@ -215,15 +277,22 @@ impl Read {
                     .decode_errors
                     .saturating_add(u32::from(output.is_err()));
             }
-            let output = output.map_err(|_| HRESULT::from_win32(ERROR_INVALID_DATA.0))?;
-            if let Some((tokens, offset)) = &self.pages {
-                return write_pages(tokens, *offset, &output);
+            let (output, decoded) = output?;
+            if decoded > self.capacity {
+                trace::clipped(self, decoded);
+            } else if decoded < self.capacity {
+                trace::short_decode(self, decoded);
+            }
+            if let Some((count, offset)) = self.pages {
+                let tokens = unsafe { core::slice::from_raw_parts(self.dest as *const u64, count) };
+                return write_pages(tokens, offset, &output);
             }
             unsafe {
                 core::ptr::copy_nonoverlapping(output.as_ptr(), self.dest as *mut u8, output.len())
             };
-        } else if let Some((tokens, offset)) = &self.pages {
-            return write_pages(tokens, *offset, &plain);
+        } else if let Some((count, offset)) = self.pages {
+            let tokens = unsafe { core::slice::from_raw_parts(self.dest as *const u64, count) };
+            return write_pages(tokens, offset, &plain);
         }
         Ok(())
     }
@@ -351,6 +420,7 @@ fn finish(shared: &Shared, entry: &Entry, result: Result<(), HRESULT>, last_erro
             let mut stats = storage_stats();
             stats.errors = stats.errors.saturating_add(1);
         }
+        trace::failure(entry, hr);
         signal_error(shared, entry, hr);
     }
 }
@@ -633,4 +703,114 @@ fn write_pages(tokens: &[u64], offset: usize, data: &[u8]) -> Result<(), HRESULT
         return Err(HRESULT::from_win32(unsafe { GetLastError() }.0));
     }
     Ok(())
+}
+
+/// `TUXBOX_TRACE_STORAGE=1`: log each distinct failed request, and compressed
+/// reads whose decoded size differs from the destination the title supplied.
+/// Repeats are counted and logged again at power-of-two totals.
+mod trace {
+    use super::*;
+    use std::collections::HashMap;
+    use windows::Win32::Storage::FileSystem::{FILE_NAME_OPENED, GetFinalPathNameByHandleW};
+
+    fn enabled() -> bool {
+        static ENABLED: OnceLock<bool> = OnceLock::new();
+        *ENABLED.get_or_init(|| std::env::var_os("TUXBOX_TRACE_STORAGE").as_deref() == Some(std::ffi::OsStr::new("1")))
+    }
+
+    /// Count one occurrence of `key`; true when the total is a power of two.
+    fn due(key: (u8, i32, u64)) -> Option<u32> {
+        static SEEN: Mutex<Option<HashMap<(u8, i32, u64), u32>>> = Mutex::new(None);
+        let mut seen = lock(&SEEN);
+        let count = seen.get_or_insert_with(HashMap::new).entry(key).or_default();
+        *count = count.saturating_add(1);
+        count.is_power_of_two().then_some(*count)
+    }
+
+    fn describe(read: &Read) -> String {
+        let source = match &read.source {
+            Source::File(file, offset) => {
+                let handle = HANDLE(file.file.as_raw_handle());
+                let required = unsafe { GetFinalPathNameByHandleW(handle, &mut [], FILE_NAME_OPENED) };
+                let mut path = vec![0; required as usize];
+                let length = unsafe { GetFinalPathNameByHandleW(handle, &mut path, FILE_NAME_OPENED) }
+                    as usize;
+                if length > 0 && length < path.len() {
+                    let path = String::from_utf16_lossy(&path[..length]);
+                    format!("file={path:?} offset={offset:#x}")
+                } else {
+                    format!("file=<unknown> offset={offset:#x}")
+                }
+            }
+            Source::Memory(address) => format!("memory {address:#x}"),
+        };
+        format!(
+            "{source} size={:#x} destination={:#x} options={:#x} compressed={} pages={:?} intermediate={:#x}",
+            read.size, read.capacity, read.options, read.options & 1 != 0,
+            read.pages.map(|(count, offset)| {
+                let first = (count > 0).then(|| unsafe { *(read.dest as *const u64) });
+                (count, first, offset)
+            }),
+            read.intermediate_size
+        )
+    }
+
+    fn totals() -> String {
+        let stats = storage_stats();
+        format!(
+            "reads={} read_errors={} decodes={} decode_errors={} errors={}",
+            stats.total_reads, stats.read_errors, stats.total_decodes, stats.decode_errors, stats.errors
+        )
+    }
+
+    pub(super) fn unsupported(options: u64) {
+        if enabled() && let Some(count) = due((6, 0, options)) {
+            debug(&format!("TuxBox xcrdapi: unsupported request options={options:#x} (#{count})"));
+        }
+    }
+
+    pub(super) fn clipped(read: &Read, decoded: usize) {
+        if enabled() && let Some(count) = due((7, 0, 0)) {
+            debug(&format!(
+                "TuxBox xcrdapi: validated clipped zlib block decoded={decoded:#x} (#{count}) {}",
+                describe(read)
+            ));
+        }
+    }
+
+    pub(super) fn failure(entry: &Entry, hr: HRESULT) {
+        if !enabled() {
+            return;
+        }
+        let (kind, options) = match entry {
+            Entry::Read(read) => (0, read.options),
+            Entry::Invalid(_, at) => (1, u64::from(*at)),
+            Entry::Status(..) => (2, 0),
+            Entry::Signal(..) => (3, 0),
+            Entry::Event(..) => (4, 0),
+        };
+        if let Some(count) = due((kind, hr.0, options)) {
+            let detail = match entry {
+                Entry::Read(read) => describe(read),
+                Entry::Invalid(_, at) => format!("invalid request at check {at}"),
+                Entry::Status(..) => "status".into(),
+                Entry::Signal(..) => "fence signal".into(),
+                Entry::Event(..) => "event".into(),
+            };
+            debug(&format!("TuxBox xcrdapi: request failed hr={:#010x} (#{count}) {detail}; {}", hr.0, totals()));
+        }
+    }
+
+    pub(super) fn short_decode(read: &Read, decoded: usize) {
+        if !enabled() {
+            return;
+        }
+        let shortfall = (decoded < read.capacity) as u64;
+        if let Some(count) = due((5, 0, shortfall)) {
+            debug(&format!(
+                "TuxBox xcrdapi: decoded {decoded:#x} bytes into a {:#x}-byte destination (#{count}) {}; {}",
+                read.capacity, describe(read), totals()
+            ));
+        }
+    }
 }

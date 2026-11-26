@@ -492,7 +492,10 @@ pub unsafe extern "system" fn write_pages(tokens: *const u64, count: usize, offs
         let legacy = match pool.pages.get(&token) {
             Some(page) if page.mapped => pool.mappings.iter().find(|&(_, t)| *t == token).map(|(&at, _)| at),
             Some(_) => None,
-            None => return failure(ERROR_INVALID_ADDRESS),
+            None => {
+                trace::write_failure("unknown token", token, within, chunk, ERROR_INVALID_ADDRESS, pool.next);
+                return failure(ERROR_INVALID_ADDRESS);
+            }
         };
         let page = pool.pages.get_mut(&token).expect("checked above");
         // SAFETY: `data` has `len` bytes; `chunk` stays inside one page.
@@ -504,6 +507,7 @@ pub unsafe extern "system" fn write_pages(tokens: *const u64, count: usize, offs
             unsafe { ptr::copy_nonoverlapping(src, page.saved.as_mut_ptr().add(within), chunk) };
         } else {
             if let Err(e) = page.section.write_at(page.offset + within as u64, src, chunk) {
+                trace::write_failure("section write", token, within, chunk, e, pool.next);
                 return failure(e);
             }
             page.has_section_data = true;
@@ -552,6 +556,7 @@ pub unsafe extern "system" fn allocate(flags: u64, count: *mut usize, tokens: *m
                 .write_unaligned((first + i as u64) * super::partitions::TITLE_PAGE_STRIDE)
         };
     }
+    trace::pool(&pool, "allocate", requested);
     unsafe { count.write_unaligned(requested) };
     1
 }
@@ -636,6 +641,7 @@ pub unsafe extern "system" fn free(count: usize, tokens: *const u64) -> i32 {
     for token in tokens {
         pool.pages.remove(token);
     }
+    trace::pool(&pool, "free", count);
     1
 }
 
@@ -810,4 +816,57 @@ pub unsafe extern "system" fn map_scatter(
         }
     }
     1
+}
+
+/// `TUXBOX_TRACE_STORAGE=1`: summarize the physical page pool every 64 calls
+/// and at power-of-two call counts. A section is committed whole once used and
+/// lives while any of its pages does, so `retained` is committed memory held
+/// only by freed pages of partly freed batches.
+mod trace {
+    use super::{PAGE, Pool, Section};
+    use std::collections::HashMap;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    fn enabled() -> bool {
+        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ENABLED.get_or_init(|| std::env::var_os("TUXBOX_TRACE_STORAGE").as_deref() == Some(std::ffi::OsStr::new("1")))
+    }
+
+    pub(super) fn write_failure(reason: &str, token: u64, offset: usize, bytes: usize, error: u32, allocated: u64) {
+        static FAILURES: AtomicU64 = AtomicU64::new(0);
+        if enabled() && (FAILURES.fetch_add(1, Ordering::Relaxed) + 1).is_power_of_two() {
+            let line = format!("TuxBox xmem: page write {reason} token={token:#x} offset={offset:#x} bytes={bytes:#x} error={error} allocated={allocated:#x}\n\0");
+            unsafe { windows_sys::Win32::System::Diagnostics::Debug::OutputDebugStringA(line.as_ptr()) };
+        }
+    }
+
+    pub(super) fn pool(pool: &Pool, call: &str, count: usize) {
+        static CALLS: AtomicU64 = AtomicU64::new(0);
+        if !enabled() {
+            return;
+        }
+        let calls = CALLS.fetch_add(1, Ordering::Relaxed) + 1;
+        if calls % 64 != 0 && !calls.is_power_of_two() {
+            return;
+        }
+        let mut sections: HashMap<*const Section, (u64, u64, bool)> = HashMap::new();
+        for page in pool.pages.values() {
+            let entry = sections.entry(std::sync::Arc::as_ptr(&page.section))
+                .or_insert((0, page.section.bytes(), page.section.materialized()));
+            entry.0 += 1;
+        }
+        let (mut committed, mut retained, mut materialized) = (0u64, 0u64, 0usize);
+        for &(live, bytes, used) in sections.values() {
+            if used {
+                materialized += 1;
+                committed += bytes;
+                retained += bytes - live * PAGE as u64;
+            }
+        }
+        let line = format!(
+            "TuxBox xmem: physical pages after {call} of {count} (call #{calls}): live={} sections={} materialized={materialized} committed={}MiB retained_by_freed={}MiB mapped={}\n\0",
+            pool.pages.len(), sections.len(), committed >> 20, retained >> 20, pool.mappings.len()
+        );
+        unsafe { windows_sys::Win32::System::Diagnostics::Debug::OutputDebugStringA(line.as_ptr()) };
+    }
 }
