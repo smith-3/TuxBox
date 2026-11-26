@@ -746,7 +746,7 @@ unsafe fn null_pipeline(
     }
     let result = unsafe { host.CreatePipelineState::<ID3D12PipelineState>(desc) };
     if result.is_ok() {
-        if crate::diagnostics::display::enabled() {
+        if crate::diagnostics::display::enabled() || crate::commands::queue_trace::enabled() {
             let stages = ["VS", "PS", "DS", "HS", "GS", "CS", "AS", "MS"].iter().enumerate()
                 .filter(|(i, _)| fields[*i].is_some())
                 .map(|(i, name)| format!("{name}={}", hashes[i].as_ref().map(|(digest, _)| digest.as_str()).unwrap_or("unknown")))

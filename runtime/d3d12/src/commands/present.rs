@@ -47,6 +47,7 @@ pub(super) fn frame_heartbeat(token: u64) {
 pub(super) unsafe fn present_planes(
     queue: &Queue, count: u32, planes: *const PresentPlane, params: *const PresentParameters,
 ) -> HRESULT {
+    let _trace = queue_trace::watch(Some(&queue.native), "PresentX", None);
     let mut submitted = queue
         .state
         .submission

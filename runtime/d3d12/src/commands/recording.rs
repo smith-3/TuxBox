@@ -452,6 +452,7 @@ impl Recording {
         dispatch: impl FnOnce(&ID3D12GraphicsCommandList),
     ) {
         self.record_unknown_write();
+        self.note_shader_fallback();
         let null_usage = self.bindings.null_usage.clone();
         let native = self.active.native.clone();
         let dispatch = move || {
@@ -552,6 +553,9 @@ impl Recording {
         draw: impl FnOnce(&ID3D12GraphicsCommandList),
     ) {
         self.record_unknown_write();
+        if rasterizes {
+            self.note_shader_fallback();
+        }
         let null_usage = self.bindings.null_usage.clone();
         let display_bound = self.display_bound;
         let native = self.active.native.clone();

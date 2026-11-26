@@ -186,7 +186,7 @@ impl SwapChain {
                 .frames
                 .get_mut(index as usize)
                 .ok_or(DXGI_ERROR_INVALID_CALL)?;
-            wait_for(&self.fence, frame.retire)?;
+            wait_for(&self.fence, frame.retire, Some(queue), "present retire wait")?;
             let buffer = self.chain.GetBuffer(index)?;
             // This frame's previous use has retired, so its panel upload
             // buffer is free to rewrite.
@@ -197,18 +197,24 @@ impl SwapChain {
             let sample = sampler::due().then(|| sampler::record(&frame.list, source, D3D12_RESOURCE_STATE_COMMON)).flatten();
             frame.list.Close()?;
             frame.source = Some(source.clone());
-            queue.ExecuteCommandLists(&[Some(ID3D12CommandList::clone(&frame.list))]);
-            if let Err(error) = queue.Signal(&self.fence, self.next) {
-                self.failed_signal = Some((error.code(), queue.clone()));
-                return Err(error);
+            {
+                let _trace = crate::commands::queue_trace::watch(
+                    Some(queue), "present submit and signal", Some((&self.fence, self.next))
+                );
+                queue.ExecuteCommandLists(&[Some(ID3D12CommandList::clone(&frame.list))]);
+                if let Err(error) = queue.Signal(&self.fence, self.next) {
+                    self.failed_signal = Some((error.code(), queue.clone()));
+                    return Err(error);
+                }
             }
             frame.retire = self.next;
             if let Some(sample) = sample {
-                wait_for(&self.fence, self.next)?;
+                wait_for(&self.fence, self.next, Some(queue), "present sample wait")?;
                 sample.report("present");
             }
             self.next = next_value;
             // Return DXGI status codes such as DXGI_STATUS_OCCLUDED to the guest.
+            let _trace = crate::commands::queue_trace::watch(Some(queue), "DXGI Present", None);
             Ok(self.chain.Present(1, DXGI_PRESENT(0)))
         }
     }
@@ -216,10 +222,10 @@ impl SwapChain {
         if let Some((_, queue)) = &self.failed_signal {
             // SAFETY: this marker follows the unfenced copy on its original queue.
             unsafe { queue.Signal(&self.fence, self.next)? };
-            wait_for(&self.fence, self.next)?;
+            wait_for(&self.fence, self.next, Some(queue), "present drain wait")?;
         }
         for frame in &self.frames {
-            wait_for(&self.fence, frame.retire)?;
+            wait_for(&self.fence, frame.retire, None, "present drain wait")?;
         }
         Ok(())
     }
@@ -246,7 +252,12 @@ impl Drop for Presentation {
     }
 }
 
-fn wait_for(fence: &ID3D12Fence, value: u64) -> Result<()> {
+fn wait_for(
+    fence: &ID3D12Fence,
+    value: u64,
+    queue: Option<&ID3D12CommandQueue>,
+    stage: &'static str,
+) -> Result<()> {
     if value == 0 {
         return Ok(());
     }
@@ -257,6 +268,7 @@ fn wait_for(fence: &ID3D12Fence, value: u64) -> Result<()> {
             return Err(DXGI_ERROR_DEVICE_REMOVED.into());
         }
         if completed < value {
+            let _trace = crate::commands::queue_trace::watch(queue, stage, Some((fence, value)));
             fence.SetEventOnCompletion(value, HANDLE::default())?;
         }
     }

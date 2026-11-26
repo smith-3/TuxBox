@@ -87,6 +87,7 @@ struct Recording {
     display_bound: bool,
     trace_target: Option<ID3D12Resource>,
     trace_samples: Vec<(String, crate::present::sampler::Sample)>,
+    trace_fallbacks: Vec<Arc<crate::diagnostics::null_usage::Tag>>,
     media: Option<media::Recording>,
     placed_reads: Vec<Arc<Texture>>,
     placed_writes: Vec<Arc<Texture>>,
@@ -104,7 +105,16 @@ struct Recording {
 }
 
 impl Recording {
-
+    fn note_shader_fallback(&mut self) {
+        if !queue_trace::enabled() || self.trace_fallbacks.len() >= 4 {
+            return;
+        }
+        if let Some(tag) = &self.bindings.null_usage
+            && !self.trace_fallbacks.contains(tag)
+        {
+            self.trace_fallbacks.push(tag.clone());
+        }
+    }
 }
 
 // Xbox callers can emit native command packets when space is available.
@@ -276,6 +286,7 @@ unsafe extern "system" fn reset(
         state.dsv_bound = false;
         state.trace_target = None;
         state.trace_samples.clear();
+        state.trace_fallbacks.clear();
         state.placed_reads.clear();
         state.placed_writes.clear();
         state.bound_placed_targets.clear();
@@ -791,6 +802,7 @@ pub(crate) unsafe fn wrap_command_list(
             display_bound: false,
             trace_target: None,
             trace_samples: Vec::new(),
+            trace_fallbacks: Vec::new(),
             placed_reads: Vec::new(),
             placed_writes: Vec::new(),
             bound_placed_targets: Vec::new(),

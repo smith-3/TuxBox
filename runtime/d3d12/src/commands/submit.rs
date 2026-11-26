@@ -62,6 +62,7 @@ pub(super) unsafe extern "system" fn execute(queue: &Queue, count: u32, lists: *
 }
 
 pub(super) unsafe fn execute_batch(queue: &Queue, count: u32, lists: *const *mut c_void, frame: Option<(u64,u32)>) {
+    let _trace = queue_trace::watch(Some(&queue.native), "submit batch", None);
     let mut submitted = queue
         .state
         .submission
@@ -88,6 +89,8 @@ pub(super) unsafe fn execute_batch(queue: &Queue, count: u32, lists: *const *mut
     let trace_samples = std::cell::RefCell::new(Vec::new());
     // The lists in this batch that write or wait on fence labels.
     let batch = std::cell::RefCell::new(String::new());
+    let traced = queue_trace::enabled();
+    let batch_trace = std::cell::RefCell::new(String::new());
     let result = translate_batch(
         guest,
         (
@@ -102,6 +105,14 @@ pub(super) unsafe fn execute_batch(queue: &Queue, count: u32, lists: *const *mut
         |&item, (textures, writes, shader_views, scene_lists, splits, batch_writes, pending)| {
             let list = unsafe { guest_list(item, parent(&queue.parent)) }.ok_or(E_INVALIDARG)?;
             let state = recording(list);
+            if traced && list_index < 8 {
+                use std::fmt::Write;
+                let mut detail = batch_trace.borrow_mut();
+                let _ = write!(detail, " list={item:p}");
+                for tag in &state.trace_fallbacks {
+                    let _ = write!(detail, " fallback({})", tag.stages);
+                }
+            }
             if !matches!(state.phase, ListState::Closed)
                 || state.error.is_err()
                 || state.list_type != queue.state.kind
@@ -216,7 +227,7 @@ pub(super) unsafe fn execute_batch(queue: &Queue, count: u32, lists: *const *mut
                         let progress = queue_trace::note(
                             &queue.native,
                             queue.state.kind.0,
-                            format!("batch of {count} lists, with labels:{}", batch.borrow()),
+                            format!("batch of {count} lists, with labels:{}{}", batch.borrow(), batch_trace.borrow()),
                             None,
                         );
                         if !batch_writes.is_empty() {
@@ -263,6 +274,12 @@ pub(super) unsafe fn execute_batch(queue: &Queue, count: u32, lists: *const *mut
         },
     );
     if let Err(error) = result {
+        if traced {
+            crate::diagnostics::log(&format!(
+                "queue trace rejected batch queue={:#x} hr={:#010x}{}",
+                queue.native.as_raw().addr(), error.0, batch_trace.borrow()
+            ));
+        }
         reject(queue, error);
     } else if let Some((token, flags)) = frame {
         static FIRST: [std::sync::Once;4] = [const { std::sync::Once::new() };4];
@@ -278,6 +295,7 @@ pub(super) unsafe extern "system" fn queue_fence<const WAIT: bool>(
     fence: *mut c_void,
     value: u64,
 ) -> HRESULT {
+    let _trace = queue_trace::watch(Some(&queue.native), if WAIT { "queue Wait" } else { "queue Signal" }, None);
     let mut submitted = queue
         .state
         .submission
@@ -305,7 +323,13 @@ pub(super) unsafe extern "system" fn queue_fence<const WAIT: bool>(
     } else {
         queue.native.vtable().Signal
     };
-    let status = unsafe { method(queue.native.as_raw(), fence.as_raw(), value) };
+    let status = {
+        let _call = queue_trace::watch(
+            Some(&queue.native), if WAIT { "native queue Wait" } else { "native queue Signal" },
+            Some((fence, value)),
+        );
+        unsafe { method(queue.native.as_raw(), fence.as_raw(), value) }
+    };
     if status.is_ok() {
         let _ = queue_trace::note(
             &queue.native,

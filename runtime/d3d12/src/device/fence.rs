@@ -138,6 +138,7 @@ unsafe extern "system" fn completed(this: &Fence) -> u64 {
 unsafe extern "system" fn on_completion(this: &Fence, value: u64, event: HANDLE) -> HRESULT {
     let host = &this.native;
     stalls::register(host, value);
+    let _trace = crate::commands::queue_trace::watch(None, "title fence event registration", Some((host, value)));
     unsafe { (host.vtable().SetEventOnCompletion)(host.as_raw(), value, event) }
 }
 
@@ -153,12 +154,13 @@ mod stalls {
     static PENDING: Mutex<Vec<Pending>> = Mutex::new(Vec::new());
 
     pub(super) fn register(fence: &ID3D12Fence, value: u64) {
-        if !crate::survey::enabled() { return; }
+        let survey = crate::survey::enabled();
+        if !survey && !crate::commands::queue_trace::enabled() { return; }
         static START: std::sync::Once = std::sync::Once::new();
         START.call_once(|| { let _ = std::thread::Builder::new().name("TuxBox fence stalls".into()).spawn(scan); });
         let mut pending = PENDING.lock().unwrap_or_else(|e| e.into_inner());
         if pending.len() < 4096 {
-            let rva = crate::survey::title_rva().unwrap_or(0);
+            let rva = if survey { crate::survey::title_rva().unwrap_or(0) } else { 0 };
             pending.push(Pending { fence: fence.clone(), value, since: Instant::now(), rva, reported: false });
         }
     }
