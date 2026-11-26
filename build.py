@@ -296,8 +296,14 @@ def build_target(tools, target, dxc, d3d12_reference=None):
             payload = ["-DWITH_PAYLOAD=1"] if header == "mesh_ms_payload" else []
             subprocess.run([dxc, "-T", profile, "-E", entry, "-O3", *payload, "-Fh", f"{header}.h",
                             "-Vn", variable, str(src / f"{shader}.hlsl")], cwd=out, check=True)
+        for variant in range(12):
+            header = f"mesh_pso_ms{variant}"
+            subprocess.run([dxc, "-T", "ms_6_5", "-E", "mesh", "-O3", f"-DMESH_PSO_VARIANT={variant}",
+                            "-Fh", f"{header}.h", "-Vn", header, str(src / "mesh_groups.hlsl")],
+                           cwd=out, check=True)
         for name, source in (("tables", "table_guest.cpp"), ("indirect", "indirect_guest.cpp"),
                              ("draw", "graphics_guest.cpp"), ("mesh", "mesh_guest.cpp"),
+                             ("mesh-pso", "mesh_pso_guest.cpp"),
                              ("null-usage", "null_usage_guest.cpp"), ("root-cbv-window", "root_cbv_guest.cpp")):
             obj = tools.compile(src / source, out, "/W4", "/WX", f"/I{out}")
             tools.link(out / f"d3d12-{name}.exe", obj, "d3d12_xs.lib", "dxgi.lib", "kernel32.lib")

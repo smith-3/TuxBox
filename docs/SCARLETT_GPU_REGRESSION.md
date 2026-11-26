@@ -22,6 +22,10 @@ Optional `--case mesh` requires a mesh-capable device. The
 `--case indirect-scarlett` mode requires the companion ABI fixture from
 PR #87. An unsupported option or missing capability is a failure, not a pass.
 
+`--case mesh-pso` also needs a mesh-capable device. It creates twelve
+distinct mesh pipelines on four threads, draws through all of them, and checks
+768 words between 96 guards.
+
 ## Forced null compute control
 
 Two pipelines deliberately use an eight-byte malformed synthetic shader;

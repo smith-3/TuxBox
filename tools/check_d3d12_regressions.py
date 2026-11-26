@@ -32,10 +32,11 @@ CASES = {
     "buffer-import-reject": ("d3d12-buffer-import", ("--reject",), "d3d12-buffer-import-reject", ("rejected=1",)),
     "buffer-unmap-alive": ("d3d12-buffer-import", ("--unmap-alive",), "d3d12-buffer-unmap", ("mode=alive",)),
     "buffer-unmap-released": ("d3d12-buffer-import", ("--unmap-released",), "d3d12-buffer-unmap", ("mode=released", "later-submits=ok")),
+    "mesh-pso": ("d3d12-mesh-pso", (), "d3d12-mesh-pso", ("jobs=4", "pipelines=12", "drawn=12", "pixels=768/768", "guards=96")),
     "null-usage": ("d3d12-null-usage", (), "d3d12-null-usage", ("words=64/64", "recorded=64", "valid=2")),
     "null-disabled": ("d3d12-null-usage", ("--reject",), "d3d12-null-disabled", ("rejected=1", "valid=1")),
 }
-DEFAULT = tuple(name for name in CASES if name not in ("root-cbv-window", "alias-deferred", "copy-resource", "indirect-scarlett", "mesh", "buffer-import", "buffer-import-reject", "buffer-layout", "buffer-remap", "buffer-unmap-alive", "buffer-unmap-released"))
+DEFAULT = tuple(name for name in CASES if name not in ("root-cbv-window", "alias-deferred", "copy-resource", "indirect-scarlett", "mesh", "mesh-pso", "buffer-import", "buffer-import-reject", "buffer-layout", "buffer-remap", "buffer-unmap-alive", "buffer-unmap-released"))
 DIGEST = hashlib.sha256(bytes.fromhex("78563412efcdab90")).hexdigest()
 
 
@@ -192,6 +193,8 @@ def main(argv=None):
                  "TUXBOX_NULL_PIPELINES":"1" if case=="null-usage" else "0",
                  "TUXBOX_REQUIRE_BUFFER_IMPORT":"1" if case.startswith("buffer-") else "0",
                  "TUXBOX_TRACE_BUFFER_BACKING":"1" if case.startswith("buffer-") or case=="root-cbv-window" else "0"}
+            if case.startswith("mesh-pso"):
+                env["TUXBOX_MESH_PSO_TEST_JOBS"]="4"
             cmd=["bwrap","--die-with-parent","--unshare-pid","--unshare-net","--ro-bind","/","/",
                  "--dev-bind","/dev","/dev","--proc","/proc","--tmpfs","/tmp","--bind",str(trial),str(trial),
                  "--unsetenv","WAYLAND_DISPLAY","--chdir",str(trial)]

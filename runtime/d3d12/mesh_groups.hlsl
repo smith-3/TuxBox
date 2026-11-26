@@ -19,6 +19,15 @@ void mesh(uint3 group : SV_GroupID,
     SetMeshOutputCounts(3, 1);
     const float2 corners[] = {float2(-1,-1), float2(-1,3), float2(3,-1)};
     uint value = 1 + 2 * group.x + 5 * group.y + 11 * group.z;
+#ifdef MESH_PSO_VARIANT
+    // Distinct, nontrivial mesh programs for the pipeline creation fixture.
+    value ^= 0x9e3779b9u * (MESH_PSO_VARIANT + 1u);
+    [unroll]
+    for (uint round = 0; round < 48; ++round) {
+        value ^= value >> (5u + (round + MESH_PSO_VARIANT) % 11u);
+        value = value * 1664525u + 1013904223u + round;
+    }
+#endif
 #ifdef WITH_PAYLOAD
     value += incoming.value;
 #endif
