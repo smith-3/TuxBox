@@ -374,3 +374,23 @@ fn sampling_a_root_uav_slot_names_the_mismatched_root() {
     let reason = refusal(&sampled_table_slot(1));
     assert!(reason.contains("image_sample_lz reads table UAV u7"), "{reason}");
 }
+
+#[test]
+fn cube_gradients_are_two_projected_derivatives_per_axis() {
+    let mut words = SAMPLE;
+    words[6] = 0xf0880118; // image_sample_d, cube: v[4:7] gradients, v[8:10] s, t, face
+    let out = super::super::translate(&pixel(&words)).unwrap();
+    assert!(out.hlsl.contains("float3 tb_cube_grad(float2 grad, float face)"));
+    assert!(out.hlsl.contains(
+        "tb_heap_tc_4.SampleGrad(tb_sampler4, tb_cube_dir(asfloat(v8), asfloat(v9), asfloat(v10)), \
+         tb_cube_grad(float2(asfloat(v4), asfloat(v5)), asfloat(v10)), \
+         tb_cube_grad(float2(asfloat(v6), asfloat(v7)), asfloat(v10)))"
+    ), "{}", out.hlsl);
+    // The clamp follows the coordinates and becomes SampleGrad's minimum LOD.
+    words[6] = 0xf08c0118; // image_sample_d_cl, cube
+    let out = super::super::translate(&pixel(&words)).unwrap();
+    assert!(out.hlsl.contains("tb_cube_grad(float2(asfloat(v6), asfloat(v7)), asfloat(v10)), asfloat(v11))"), "{}", out.hlsl);
+    // A program without cube gradients does not carry the helper.
+    let plain = super::super::translate(&pixel(&SAMPLE)).unwrap();
+    assert!(!plain.hlsl.contains("tb_cube_grad"));
+}
