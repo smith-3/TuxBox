@@ -211,3 +211,75 @@ fn a_static_sampler_the_root_leaves_out_takes_its_declared_register() {
     elsewhere[10] = 1;
     assert_eq!(omitted(&[(17, 1), (1, 1)], &[17, 1], &[elsewhere]), None);
 }
+
+fn pixel_with_sampler(words: &[u32], features: u64, fssm_register: u32) -> Vec<u8> {
+    use crate::{container::tests::container_with, xdat::tests::{container, xbch}};
+    let dwords = |values: &[u32]| values.iter().flat_map(|n| n.to_le_bytes()).collect::<Vec<_>>();
+    let mut image = vec![0u8; 0x170];
+    let write_u64 = |bytes: &mut [u8], at: usize, value: u64| {
+        bytes[at..at + 8].copy_from_slice(&value.to_le_bytes());
+    };
+    write_u64(&mut image, 0, 6);
+    for slot in 0..12 {
+        write_u64(&mut image, 8 + 8 * slot, if slot == 7 { 0x80 } else { 0xdead_beef_dead_beef });
+    }
+    write_u64(&mut image, 0x80, 0x170);
+    write_u64(&mut image, 0x88, (words.len() * 4) as u64);
+    image.extend(dwords(words));
+    let records_offset = image.len() as u64;
+    write_u64(&mut image, 0xe0, records_offset);
+    image[0xec..0xf0].copy_from_slice(&1u32.to_le_bytes());
+    image.extend(dwords(&[0x401, 0, fssm_register, 0, 0]));
+    let mut fssm = Vec::from(*b"FSSM\x01\x01\0\0");
+    fssm.extend((image.len() as u64).to_le_bytes());
+    fssm.extend(image);
+    let xdat = container(&[(13, xbch(&fssm)), (7, b"NOBC".to_vec())]);
+    let mut dxil = dwords(&[
+        0x66, ((24 + xdat.len()) / 4) as u32, u32::from_le_bytes(*b"DXIL"),
+        0x100, (16 + xdat.len() - 4) as u32, 4,
+    ]);
+    dxil.extend(xdat);
+    let psv = dwords(&[0, 1, 16, 1, 1, 0, 0]);
+    container_with(&[(b"DXIL", &dxil), (b"PSV0", &psv), (b"SFI0", &features.to_le_bytes())])
+}
+
+#[test]
+fn a_mesh_pixel_root_can_add_a_proven_omitted_sampler() {
+    use crate::rootsig::{RootParam, RootParamKind, RootRange, RootSig};
+    let mut words = [
+        0xb008_0400,              // s8, 4:1 anisotropy
+        0xbe89_03ff, 0x00c0_0000, // s9, maximum LOD 12
+        0xbe8a_03ff, 0x18f0_0000, // s10, anisotropic min/mag and linear mip
+        0xbe8b_0380,              // s11, zero
+        0xf080_0f08, 0x0040_0a0a, // image_sample with s[8:11]
+        0xbf81_0000,
+    ];
+    let point = super::descriptor([0, 0xc00000, 0x14000000, 0], 0, 1, 0, false).unwrap();
+    let mut root = RootSig {
+        version: 2, flags: 0x400, params: vec![],
+        num_static_samplers: 1, static_samplers: vec![point],
+    };
+    let shader = pixel_with_sampler(&words, 1 << 25, 0);
+    let recovered = super::mesh_pixel_omissions(&shader, &root);
+    assert_eq!(recovered, [[0x55, 1, 1, 1, 0, 4, 1, 0, 0, 12.0_f32.to_bits(), 1, 32765, 5]]);
+    assert!(super::mesh_pixel_omissions(&pixel_with_sampler(&words, 3 << 25, 0), &root).is_empty());
+    assert!(super::mesh_pixel_omissions(&pixel_with_sampler(&words, 1 << 25, 1), &root).is_empty());
+    for disabled in [0x20, 0x800] {
+        root.flags |= disabled;
+        assert!(super::mesh_pixel_omissions(&shader, &root).is_empty());
+        root.flags &= !disabled;
+    }
+    root.params.push(RootParam {
+        visibility: 0,
+        kind: RootParamKind::Table(vec![RootRange {
+            range_type: 3, num: 1, base_register: 1, space: 32765, offset_in_table: 0,
+        }]),
+    });
+    assert!(super::mesh_pixel_omissions(&shader, &root).is_empty());
+    root.params.clear();
+    root.static_samplers = vec![super::descriptor([0x400, 0xc00000, 0x18f00000, 0], 0, 1, 0, false).unwrap()];
+    assert!(super::mesh_pixel_omissions(&shader, &root).is_empty());
+    root.static_samplers = vec![point];
+    words[0] = 0xbe88_0302; // s_mov_b32 s8, s2, whose state is unknown.
+    assert!(super::mesh_pixel_omissions(&pixel_with_sampler(&words, 1 << 25, 0), &root).is_empty());
+}

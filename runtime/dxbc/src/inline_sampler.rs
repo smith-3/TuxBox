@@ -348,6 +348,10 @@ fn classify(isa: &[u8], visibility: u32, partial: bool) -> Option<InlineSamplers
 /// synthesizing omitted pixel or compute static samplers. Dynamic heap samplers require
 /// the guest's actual sampler heap.
 pub fn private(shader: &[u8], stage: u32) -> Option<Vec<[u32; 13]>> {
+    confirmed_private(shader, stage, 0)
+}
+
+fn confirmed_private(shader: &[u8], stage: u32, pixel_heap_features: u64) -> Option<Vec<[u32; 13]>> {
     let d = Dxbc::parse(shader).ok()?;
     let chunk = |tag| {
         let c = d.chunk(tag)?;
@@ -356,7 +360,7 @@ pub fn private(shader: &[u8], stage: u32) -> Option<Vec<[u32; 13]>> {
     let dxil = chunk(b"DXIL")?;
     if !matches!(stage, 0 | 5)
         || word(dxil, 0)? >> 16 != stage
-        || (stage != 5 && u64::from_le_bytes(chunk(b"SFI0")?.try_into().ok()?) & (3 << 25) != 0)
+        || (stage != 5 && u64::from_le_bytes(chunk(b"SFI0")?.try_into().ok()?) & (3 << 25) != pixel_heap_features)
     {
         return None;
     }
@@ -401,6 +405,35 @@ pub fn private(shader: &[u8], stage: u32) -> Option<Vec<[u32; 13]>> {
         )?
         .descriptors,
     )
+}
+
+/// Recover omitted pixel samplers for a reflected mesh pipeline with direct
+/// resource heap indexing. The sampler states must all be proven literals,
+/// and the host and translation roots must both append the returned entries.
+pub fn mesh_pixel_omissions(shader: &[u8], root: &crate::rootsig::RootSig) -> Vec<[u32; 13]> {
+    use crate::rootsig::RootParamKind;
+    // Resource heap indexing is independent of sampler heap indexing.
+    if root.flags & 0x400 == 0 || root.flags & 0x820 != 0 || root.static_samplers.is_empty()
+        || root.static_samplers.iter().any(|s| s[11] == 32765)
+        || root.params.iter().any(|p| matches!(&p.kind, RootParamKind::Table(ranges)
+            if ranges.iter().any(|r| r.range_type == 3 && r.space == 32765)))
+    {
+        return Vec::new();
+    }
+    let Some(states) = confirmed_private(shader, 0, 1 << 25) else {
+        return Vec::new();
+    };
+    let visible = || root.static_samplers.iter().filter(|s| matches!(s[12], 0 | 5));
+    // xshader uses the register number as its local name, even across spaces.
+    let free = (0..).filter(|register| !visible().any(|s| s[10] == *register));
+    states.into_iter()
+        .filter(|state| !visible().any(|s| s[..10] == state[..10]))
+        .zip(free)
+        .map(|(mut state, register)| {
+            state[10] = register;
+            state
+        })
+        .collect()
 }
 
 /// Static samplers a pixel shader declares in PSV and FSSM and carries as literal

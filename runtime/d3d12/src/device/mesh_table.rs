@@ -40,6 +40,7 @@ pub(super) fn reflected(
     if layout.replacements.is_empty() && pixel_tables.is_empty() {
         return Ok(None);
     }
+    let recovered_samplers = pixel.map_or_else(Vec::new, |code| recover_pixel_samplers(code, &root));
     let mesh_rewritten: Vec<usize> = layout.replacements.keys().copied().collect();
     let mut lengths = vec![0; root.params.len()];
     let mut accessed_views = Vec::new();
@@ -215,9 +216,25 @@ pub(super) fn reflected(
                 pDescriptorRanges: ranges.as_ptr(),
             })
         };
+        let mut samplers = Vec::new();
+        if !recovered_samplers.is_empty() {
+            if source.NumStaticSamplers as usize != root.static_samplers.len() {
+                return Err(E_INVALIDARG.into());
+            }
+            if source.NumStaticSamplers != 0 {
+                if source.pStaticSamplers.is_null() { return Err(E_INVALIDARG.into()); }
+                samplers.extend_from_slice(std::slice::from_raw_parts(source.pStaticSamplers, source.NumStaticSamplers as usize));
+            }
+            samplers.extend(recovered_samplers.into_iter().map(super::compute_table::static_sampler));
+            desc.Anonymous.Desc_1_1.NumStaticSamplers = samplers.len() as u32;
+            desc.Anonymous.Desc_1_1.pStaticSamplers = samplers.as_ptr();
+        }
         // The root the pixel program is translated against: the title's, with
         // those tables as the program reads them.
-        let pixel_root = if pixel_storage.is_empty() {
+        // A formerly empty root keeps the translation's existing private slots.
+        // Appending omitted states to a populated root also changes the compiler input.
+        let complete_pixel_root = !root.static_samplers.is_empty() && !samplers.is_empty();
+        let pixel_root = if pixel_storage.is_empty() && !complete_pixel_root {
             None
         } else {
             let mut for_pixel = originals.clone();
@@ -227,6 +244,10 @@ pub(super) fn reflected(
                 }
             }
             let mut pixel_desc = desc;
+            if !complete_pixel_root {
+                pixel_desc.Anonymous.Desc_1_1.NumStaticSamplers = source.NumStaticSamplers;
+                pixel_desc.Anonymous.Desc_1_1.pStaticSamplers = source.pStaticSamplers;
+            }
             pixel_desc.Anonymous.Desc_1_1.NumParameters = for_pixel.len() as u32;
             pixel_desc.Anonymous.Desc_1_1.pParameters = for_pixel.as_ptr();
             let mut blob = None;
@@ -279,6 +300,22 @@ pub(super) fn reflected(
             pixel_root,
         })))
     }
+}
+
+fn recover_pixel_samplers(code: &[u8], root: &RootSig) -> Vec<[u32; 13]> {
+    if !root.static_samplers.is_empty() {
+        return tuxbox_dxbc::inline_sampler::mesh_pixel_omissions(code, root);
+    }
+    let unsupported_flags = D3D12_ROOT_SIGNATURE_FLAG_SAMPLER_HEAP_DIRECTLY_INDEXED.0
+        | D3D12_ROOT_SIGNATURE_FLAG_DENY_PIXEL_SHADER_ROOT_ACCESS.0;
+    let private_table = root.params.iter().any(|p| {
+        matches!(p.visibility, 0 | 5) && matches!(&p.kind, RootParamKind::Table(ranges)
+            if ranges.iter().any(|r| r.range_type == 3 && r.space == 32765))
+    });
+    if root.flags & unsupported_flags as u32 != 0 || private_table {
+        return Vec::new();
+    }
+    tuxbox_dxbc::inline_sampler::private(code, 0).unwrap_or_default()
 }
 
 fn collect_pixel_accesses(
