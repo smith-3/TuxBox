@@ -39,7 +39,13 @@ pub(crate) struct LazyMesh {
 impl LazyMesh {
     /// Defer `recipe`, or `None` when it cannot outlive the title's call.
     pub(super) fn defer(recipe: &MeshRecipe<'_>, host: &ID3D12Device2) -> Option<Self> {
-        let recipe = recipe.spooled()?;
+        let Some(recipe) = recipe.spooled() else {
+            static REFUSED: std::sync::Once = std::sync::Once::new();
+            crate::diagnostics::log_once(&REFUSED, || format!(
+                "mesh lazy: {} is created now (guest pointers, an amplification stage, or no spool)", recipe.label()
+            ));
+            return None;
+        };
         Stats::get().deferred.fetch_add(1, Ordering::Relaxed);
         Stats::report();
         Some(Self {
@@ -86,7 +92,7 @@ impl LazyMesh {
 /// The object a lazy pipeline's proxy wraps until first bind: one resource-free
 /// compute pipeline per device. It is never bound for a draw.
 pub(super) fn placeholder(device: &Device) -> Option<ID3D12PipelineState> {
-    device.state.mesh_placeholder.get_or_init(|| {
+    let placeholder = device.state.mesh_placeholder.get_or_init(|| {
         let code = super::fallback::shader(super::fallback::Stage::Compute)?;
         let desc = D3D12_ROOT_SIGNATURE_DESC::default();
         let mut blob = None;
@@ -106,7 +112,12 @@ pub(super) fn placeholder(device: &Device) -> Option<ID3D12PipelineState> {
         let native = unsafe { device.native.CreateComputePipelineState(&pipeline) };
         unsafe { core::mem::ManuallyDrop::drop(&mut pipeline.pRootSignature) };
         native.ok()
-    }).clone()
+    }).clone();
+    if placeholder.is_none() {
+        static MISSING: std::sync::Once = std::sync::Once::new();
+        crate::diagnostics::log_once(&MISSING, || "mesh lazy: no placeholder pipeline; mesh pipelines are created now".into());
+    }
+    placeholder
 }
 
 #[derive(Default)]

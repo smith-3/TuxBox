@@ -111,6 +111,8 @@ unsafe fn create(
     let mut samples = 1;
     let mut rectangles = false;
     let mut stream_output = false;
+    // A non-empty input layout or view instancing record reads guest memory.
+    let mut foreign_pointers = false;
     let mut geometry_record = ptr::null_mut::<D3D12_SHADER_BYTECODE>();
     let mut stages = Vec::new();
     let mut original = [None; 8];
@@ -192,6 +194,8 @@ unsafe fn create(
                     unsafe { (*payload.cast::<D3D12_STREAM_OUTPUT_DESC>()).NumEntries != 0 }
             }
             8 => blend = payload.cast(),
+            12 => foreign_pointers |= unsafe { (*payload.cast::<D3D12_INPUT_LAYOUT_DESC>()).NumElements != 0 },
+            22 => foreign_pointers |= unsafe { (*payload.cast::<D3D12_VIEW_INSTANCING_DESC>()).ViewInstanceCount != 0 },
             14 if unsafe { payload.cast::<i32>().read() } == rectangle::PIPELINE_TYPE => {
                 rectangles = true;
                 unsafe {
@@ -531,7 +535,7 @@ unsafe fn create(
         // SAFETY: the stream storage, its field pointers, the translated
         // shaders, and the guest's root and stages are live for this call.
         let recipe = unsafe {
-            super::mesh_pipeline::MeshRecipe::capture(output, size, &fields, root_record, seen, relink, hashes.clone(), label.clone())
+            super::mesh_pipeline::MeshRecipe::capture(output, size, &fields, root_record, foreign_pointers || stream_output, relink, hashes.clone(), label.clone())
         }
         .ok_or(E_INVALIDARG)?;
         // A deferred pipeline is created when a command list first binds it.

@@ -13,10 +13,6 @@ use windows::Win32::Foundation::{E_FAIL, E_INVALIDARG};
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::core::Interface;
 
-/// Subobjects whose payload points at memory outside the stream and its
-/// shaders: stream output, input layout, and view instancing.
-const FOREIGN_POINTER_TAGS: u32 = 1 << 7 | 1 << 12 | 1 << 22;
-
 /// Bytes a recipe needs: borrowed during the title's call, or stored on disk.
 enum Code<'a> {
     Borrowed(&'a [u8]),
@@ -91,7 +87,7 @@ pub(super) struct MeshRecipe<'a> {
     amplification: Option<Field<'a>>,
     /// Keeps the root signature the stream points at alive.
     root: Option<ID3D12RootSignature>,
-    /// No subobject points outside the stream, its shaders and its root.
+    /// No subobject reads memory outside the stream, its shaders and its root.
     self_contained: bool,
     relink: Option<Relink<'a>>,
     hashes: [Option<(String, bool)>; 8],
@@ -110,7 +106,7 @@ impl<'a> MeshRecipe<'a> {
         size: usize,
         fields: &[Option<*mut D3D12_SHADER_BYTECODE>; 8],
         root_record: Option<*mut *mut c_void>,
-        seen_tags: u32,
+        foreign_pointers: bool,
         relink: Option<Relink<'a>>,
         hashes: [Option<(String, bool)>; 8],
         label: String,
@@ -146,7 +142,7 @@ impl<'a> MeshRecipe<'a> {
             pixel: field(1),
             amplification: field(6),
             root,
-            self_contained: only_mesh_stages && seen_tags & FOREIGN_POINTER_TAGS == 0,
+            self_contained: only_mesh_stages && !foreign_pointers,
             relink,
             hashes,
             label,

@@ -32,6 +32,43 @@ using Words = std::array<UINT, block * cases>;
 template<std::size_t N>
 D3D12_SHADER_BYTECODE shader(const unsigned char (&bytes)[N]) { return {bytes, N}; }
 
+// MeshPipelineStream with a view instancing record that names no views, as
+// CD3DX12_PIPELINE_MESH_STATE_STREAM and the retail builder emit. The
+// console's stencil record stays last.
+struct InstancedMeshStream {
+    frame_abi::Part<UINT> flags{20, 0};
+    frame_abi::Part<ID3D12RootSignature*> root{0, nullptr};
+    frame_abi::Part<D3D12_PRIMITIVE_TOPOLOGY_TYPE> topology{14, D3D12_PRIMITIVE_TOPOLOGY_TYPE_POINT};
+    frame_abi::Part<D3D12_SHADER_BYTECODE> ms{24, {}}, as{23, {}}, ps{2, {}};
+    frame_abi::Part<D3D12_BLEND_DESC> blend{8, {}};
+    frame_abi::Part<D3D12_DEPTH_STENCIL_DESC1> depth{21, {}};
+    frame_abi::Part<DXGI_FORMAT> dsv{16, DXGI_FORMAT_UNKNOWN};
+    frame_abi::Part<D3D12_RASTERIZER_DESC> raster{10, {}};
+    frame_abi::Part<D3D12_RT_FORMAT_ARRAY> formats{15, {}};
+    frame_abi::Part<DXGI_SAMPLE_DESC> samples{17, {1, 0}};
+    frame_abi::Part<UINT> mask{9, ~0u};
+    frame_abi::Part<D3D12_CACHED_PIPELINE_STATE> cached{19, {}};
+    frame_abi::Part<D3D12_VIEW_INSTANCING_DESC> instancing{22, {}};
+    UINT extension = 26;
+    BYTE stencil[28]{};
+};
+
+InstancedMeshStream instanced(ID3D12RootSignature* root, D3D12_SHADER_BYTECODE mesh, D3D12_SHADER_BYTECODE pixel) {
+    const MeshPipelineStream plain = stream(root, mesh, pixel);
+    InstancedMeshStream s;
+    s.root.payload = root;
+    s.ms.payload = mesh;
+    s.ps.payload = pixel;
+    s.raster.payload = plain.raster.payload;
+    return s;
+}
+
+HRESULT create(const Context& ctx, InstancedMeshStream& stream, ComPtr<ID3D12PipelineState>& pso) {
+    D3D12_PIPELINE_STATE_STREAM_DESC desc{sizeof(stream), &stream};
+    return method<CreateStream>(ctx.device2.Get(), 86)(ctx.device2.Get(), &desc,
+                                                       IID_PPV_ARGS(pso.ReleaseAndGetAddressOf()));
+}
+
 const std::array<D3D12_SHADER_BYTECODE, cases> programs{
     shader(mesh_pso_ms0), shader(mesh_pso_ms1), shader(mesh_pso_ms2), shader(mesh_pso_ms3),
     shader(mesh_pso_ms4), shader(mesh_pso_ms5), shader(mesh_pso_ms6), shader(mesh_pso_ms7),
@@ -92,11 +129,8 @@ std::string run(const wchar_t* adapter, bool) {
     D3D12_ROOT_SIGNATURE_DESC desc{1, &param, 0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_NONE};
     auto root = ctx.root(desc);
 
-    std::array<MeshPipelineStream, cases> streams;
-    for (UINT i = 0; i < cases; ++i) {
-        streams[i] = stream(root.Get(), programs[i], shader(mesh_ps));
-        streams[i].topology.payload = D3D12_PRIMITIVE_TOPOLOGY_TYPE_POINT;
-    }
+    std::array<InstancedMeshStream, cases> streams;
+    for (UINT i = 0; i < cases; ++i) streams[i] = instanced(root.Get(), programs[i], shader(mesh_ps));
     std::array<ComPtr<ID3D12PipelineState>, cases> pipelines;
     std::array<Sample, cases> samples;
     std::promise<Clock::time_point> release;
@@ -108,7 +142,7 @@ std::string run(const wchar_t* adapter, bool) {
                 const auto begin = start.get();
                 for (UINT i = worker; i < cases; i += jobs) {
                     const auto call = Clock::now();
-                    const HRESULT status = ctx.create_pipeline(streams[i], pipelines[i]);
+                    const HRESULT status = create(ctx, streams[i], pipelines[i]);
                     samples[i] = {nanos(call - begin), nanos(Clock::now() - call), status};
                 }
             });
