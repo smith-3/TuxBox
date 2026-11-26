@@ -40,7 +40,7 @@ pub(super) fn reflected(
     if layout.replacements.is_empty() && pixel_tables.is_empty() {
         return Ok(None);
     }
-    let recovered_samplers = pixel.map_or_else(Vec::new, |code| recover_pixel_samplers(code, &root));
+    let recovered_samplers = pixel.map_or_else(Vec::new, |code| tuxbox_dxbc::inline_sampler::mesh_pixel_samplers(code, &root));
     let mesh_rewritten: Vec<usize> = layout.replacements.keys().copied().collect();
     let mut lengths = vec![0; root.params.len()];
     let mut accessed_views = Vec::new();
@@ -300,22 +300,6 @@ pub(super) fn reflected(
             pixel_root,
         })))
     }
-}
-
-fn recover_pixel_samplers(code: &[u8], root: &RootSig) -> Vec<[u32; 13]> {
-    if !root.static_samplers.is_empty() {
-        return tuxbox_dxbc::inline_sampler::mesh_pixel_omissions(code, root);
-    }
-    let unsupported_flags = D3D12_ROOT_SIGNATURE_FLAG_SAMPLER_HEAP_DIRECTLY_INDEXED.0
-        | D3D12_ROOT_SIGNATURE_FLAG_DENY_PIXEL_SHADER_ROOT_ACCESS.0;
-    let private_table = root.params.iter().any(|p| {
-        matches!(p.visibility, 0 | 5) && matches!(&p.kind, RootParamKind::Table(ranges)
-            if ranges.iter().any(|r| r.range_type == 3 && r.space == 32765))
-    });
-    if root.flags & unsupported_flags as u32 != 0 || private_table {
-        return Vec::new();
-    }
-    tuxbox_dxbc::inline_sampler::private(code, 0).unwrap_or_default()
 }
 
 fn collect_pixel_accesses(

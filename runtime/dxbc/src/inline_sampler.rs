@@ -436,6 +436,52 @@ pub fn mesh_pixel_omissions(shader: &[u8], root: &crate::rootsig::RootSig) -> Ve
         .collect()
 }
 
+/// Literal pixel samplers a reflected mesh pipeline must append to its root.
+///
+/// A root with static samplers of its own gets the declared states it leaves
+/// out, unless a visible sampler table already covers one of their registers.
+/// An empty root gets the program's private samplers, unless a visible table
+/// already claims the private space. Sampler heap indexing and denied pixel
+/// root access need the guest's own samplers, so they recover nothing.
+pub fn mesh_pixel_samplers(shader: &[u8], root: &crate::rootsig::RootSig) -> Vec<[u32; 13]> {
+    use crate::rootsig::{RootParamKind, RootRange};
+    const DENY_PIXEL_ROOT_ACCESS: u32 = 0x20;
+    const RESOURCE_HEAP_INDEXED: u32 = 0x400;
+    const SAMPLER_HEAP_INDEXED: u32 = 0x800;
+    if root.flags & (SAMPLER_HEAP_INDEXED | DENY_PIXEL_ROOT_ACCESS) != 0 {
+        return Vec::new();
+    }
+    let mut pixel_sampler_ranges = root.params.iter()
+        .filter(|param| matches!(param.visibility, 0 | 5))
+        .filter_map(|param| match &param.kind {
+            RootParamKind::Table(ranges) => Some(ranges),
+            _ => None,
+        })
+        .flatten()
+        .filter(|range| range.range_type == 3);
+    let covers = |range: &RootRange, sampler: &[u32; 13]| {
+        sampler[11] == range.space
+            && sampler[10].checked_sub(range.base_register)
+                .is_some_and(|offset| range.num == u32::MAX || offset < range.num)
+    };
+    if root.static_samplers.is_empty() {
+        if pixel_sampler_ranges.any(|range| range.space == 32765) {
+            return Vec::new();
+        }
+        return private(shader, 0).unwrap_or_default();
+    }
+    if root.flags & RESOURCE_HEAP_INDEXED != 0 {
+        return mesh_pixel_omissions(shader, root);
+    }
+    let Some(recovered) = omitted(shader, root) else {
+        return Vec::new();
+    };
+    if pixel_sampler_ranges.any(|range| recovered.iter().any(|sampler| covers(range, sampler))) {
+        return Vec::new();
+    }
+    recovered
+}
+
 /// Static samplers a pixel shader declares in PSV and FSSM and carries as literal
 /// states, but that the title's root signature leaves out. The console compiles a
 /// static sampler into the program, so a title can drop it from the root it creates

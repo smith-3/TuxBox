@@ -283,3 +283,49 @@ fn a_mesh_pixel_root_can_add_a_proven_omitted_sampler() {
     words[0] = 0xbe88_0302; // s_mov_b32 s8, s2, whose state is unknown.
     assert!(super::mesh_pixel_omissions(&pixel_with_sampler(&words, 1 << 25, 0), &root).is_empty());
 }
+
+#[test]
+fn an_ordinary_mesh_pixel_root_recovers_the_declared_sampler_it_leaves_out() {
+    use crate::rootsig::{RootParam, RootParamKind, RootRange, RootSig};
+    let words = [
+        0xb008_0400u32,           // s8, 4:1 anisotropy
+        0xbe89_03ff, 0x00c0_0000, // s9, maximum LOD 12
+        0xbe8a_03ff, 0x18f0_0000, // s10, anisotropic min/mag and linear mip
+        0xbe8b_0380,              // s11, zero
+        0xf080_0f08, 0x0040_0a0a, // image_sample with s[8:11], declared as s0, space 1
+        0xbf81_0000,
+    ];
+    let shader = pixel_with_sampler(&words, 0, 0);
+    let mut elsewhere = super::descriptor([0, 0xc00000, 0x14000000, 0], 0, 1, 0, false).unwrap();
+    elsewhere[10] = 5;
+    let root = |flags, params| RootSig {
+        version: 2, flags, params, num_static_samplers: 1, static_samplers: vec![elsewhere],
+    };
+    let table = |visibility, base_register, num, space| RootParam {
+        visibility,
+        kind: RootParamKind::Table(vec![RootRange { range_type: 3, num, base_register, space, offset_in_table: 0 }]),
+    };
+    let recovered = vec![[0x55, 1, 1, 1, 0, 4, 1, 0, 0, 12.0_f32.to_bits(), 0, 1, 5]];
+    // The failing MatrixVI pixel stages: static samplers, no heap indexing.
+    assert_eq!(super::mesh_pixel_samplers(&shader, &root(0, vec![])), recovered);
+    // The guest's own samplers are needed.
+    for flags in [0x20, 0x800] {
+        assert!(super::mesh_pixel_samplers(&shader, &root(flags, vec![])).is_empty());
+    }
+    // A visible sampler table already binds s0 in space 1.
+    assert!(super::mesh_pixel_samplers(&shader, &root(0, vec![table(5, 0, 1, 1)])).is_empty());
+    assert!(super::mesh_pixel_samplers(&shader, &root(0, vec![table(0, 0, u32::MAX, 1)])).is_empty());
+    // Tables in another space, after the register, or for another stage do not.
+    for other in [table(5, 0, 1, 2), table(5, 1, 4, 1), table(1, 0, 1, 1)] {
+        assert_eq!(super::mesh_pixel_samplers(&shader, &root(0, vec![other])), recovered);
+    }
+    // Direct resource heap indexing takes the proven-literal path.
+    assert_eq!(
+        super::mesh_pixel_samplers(&shader, &root(0x400, vec![])),
+        super::mesh_pixel_omissions(&shader, &root(0x400, vec![])),
+    );
+    // An empty root takes the private samplers, unless a table claims their space.
+    let empty = |params| RootSig { version: 2, flags: 0, params, num_static_samplers: 0, static_samplers: vec![] };
+    assert_eq!(super::mesh_pixel_samplers(&shader, &empty(vec![])), super::private(&shader, 0).unwrap_or_default());
+    assert!(super::mesh_pixel_samplers(&shader, &empty(vec![table(0, 0, 1, 32765)])).is_empty());
+}
