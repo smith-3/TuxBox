@@ -129,7 +129,12 @@ pub(super) fn decode_operands(enc: Enc, raw: &[u32]) -> (Vec<Opnd>, Vec<Opnd>, I
             aux.imm = i64::from((first >> 15) & 1);
             aux.imm2 = i64::from((second >> 27) & 3);
             let literal = raw.get(2).copied().unwrap_or(0);
-            let inputs = [0, 9, 18].map(|shift| source((second >> shift) & 511, literal));
+            let mut inputs = [0, 9, 18].map(|shift| source((second >> shift) & 511, literal));
+            if first >> 26 == 0x35 && matches!((first >> 16) & 0x3ff, 834 | 835 | 858) {
+                // FP16 interpolation encodes the LDS attribute, channel and half
+                // in SRC0. Its high-half bit is not a VGPR selector.
+                inputs[0] = Opnd::ConstInt(i64::from(second & 511));
+            }
             (vec![dest], inputs.to_vec())
         }
         Enc::Vinterp => {
