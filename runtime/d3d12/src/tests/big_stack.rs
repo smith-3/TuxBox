@@ -35,7 +35,7 @@ fn async_limit_accepts_a_single_worker_and_bounds_the_override() {
 #[test]
 fn a_zero_deadline_waits_for_the_compile() {
     let _guard = lock();
-    let wait = super::run_for("block", std::time::Duration::ZERO, || {
+    let wait = super::run_for("block", std::time::Duration::ZERO, 0, || {
         std::thread::sleep(std::time::Duration::from_millis(30));
         4
     });
@@ -46,7 +46,7 @@ fn a_zero_deadline_waits_for_the_compile() {
 #[test]
 fn a_finished_compile_releases_its_slot() {
     let _guard = lock();
-    let wait = super::run_for("fast", std::time::Duration::from_secs(2), || 5);
+    let wait = super::run_for("fast", std::time::Duration::from_secs(2), 0, || 5);
     assert!(matches!(wait, super::PipelineWait::Ready(5)));
     assert_eq!(super::inflight(), 0);
 }
@@ -59,7 +59,7 @@ fn a_slow_compile_is_detached_and_still_finishes() {
     let gate_in_job = std::sync::Arc::clone(&gate);
     let done_in_job = std::sync::Arc::clone(&done);
     let started = std::time::Instant::now();
-    let wait = super::run_for("slow", std::time::Duration::from_millis(40), move || {
+    let wait = super::run_for("slow", std::time::Duration::from_millis(40), 0, move || {
         let (lock, wake) = &*gate_in_job;
         let mut open = lock.lock().unwrap_or_else(|error| error.into_inner());
         while !*open {
@@ -96,7 +96,7 @@ fn first_use_prioritizes_its_compile_without_exceeding_the_limit() {
     let _restore = Restore(previous);
     let gate = std::sync::Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
     let gate_in_job = std::sync::Arc::clone(&gate);
-    let holder = super::run_for("hold", std::time::Duration::from_millis(30), move || {
+    let holder = super::run_for("hold", std::time::Duration::from_millis(30), 0, move || {
         let (lock, wake) = &*gate_in_job;
         let mut open = lock.lock().unwrap_or_else(|error| error.into_inner());
         while !*open {
@@ -107,7 +107,7 @@ fn first_use_prioritizes_its_compile_without_exceeding_the_limit() {
     let super::PipelineWait::Deferred(holder) = holder else { panic!("the holder should outlive the deadline") };
     // The only slot is busy, so this compile waits in the queue.
     let (job_started, started) = std::sync::mpsc::channel();
-    let queued = super::run_for("queued", std::time::Duration::from_secs(5), move || {
+    let queued = super::run_for("queued", std::time::Duration::from_secs(5), 0, move || {
         job_started.send(()).unwrap();
         2
     });
@@ -132,12 +132,25 @@ fn first_use_prioritizes_its_compile_without_exceeding_the_limit() {
 }
 
 #[test]
-fn queue_limit_accepts_a_bounded_override() {
-    assert_eq!(super::queue_limit(None), 64);
-    assert_eq!(super::queue_limit(Some(" 8 ")), 8);
-    assert_eq!(super::queue_limit(Some("0")), 64);
-    assert_eq!(super::queue_limit(Some("4097")), 64);
-    assert_eq!(super::queue_limit(Some("many")), 64);
+fn queue_budget_is_a_bounded_number_of_mebibytes() {
+    assert_eq!(super::queue_budget_bytes(None), 256 << 20);
+    assert_eq!(super::queue_budget_bytes(Some(" 8 ")), 8 << 20);
+    assert_eq!(super::queue_budget_bytes(Some("0")), 256 << 20);
+    assert_eq!(super::queue_budget_bytes(Some("16385")), 256 << 20);
+    assert_eq!(super::queue_budget_bytes(Some("many")), 256 << 20);
+}
+
+#[test]
+fn a_compile_larger_than_the_budget_queues_alone() {
+    let mut queue = super::Queue { jobs: Default::default(), bytes: 0 };
+    let job = |bytes| super::Queued { label: String::new(), id: 0, bytes, job: Box::new(|| {}) };
+    assert!(queue.has_room(10, 4), "an empty queue takes any compile");
+    queue.push_back(job(10));
+    assert!(!queue.has_room(1, 4));
+    assert!(queue.pop_front().is_some());
+    assert_eq!(queue.bytes, 0);
+    queue.push_back(job(2));
+    assert!(queue.has_room(2, 4) && !queue.has_room(3, 4));
 }
 
 #[test]
@@ -150,10 +163,10 @@ fn creation_past_the_queue_limit_waits_for_room() {
         }
     }
     let _live = Restore(&super::MAX_LIVE, super::MAX_LIVE.swap(1, std::sync::atomic::Ordering::SeqCst));
-    let _queued = Restore(&super::MAX_QUEUED, super::MAX_QUEUED.swap(1, std::sync::atomic::Ordering::SeqCst));
+    let _queued = Restore(&super::QUEUE_BUDGET, super::QUEUE_BUDGET.swap(1, std::sync::atomic::Ordering::SeqCst));
     let gate = std::sync::Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
     let gate_in_job = std::sync::Arc::clone(&gate);
-    let holder = super::run_for("hold", std::time::Duration::from_millis(30), move || {
+    let holder = super::run_for("hold", std::time::Duration::from_millis(30), 1, move || {
         let (lock, wake) = &*gate_in_job;
         let mut open = lock.lock().unwrap_or_else(|error| error.into_inner());
         while !*open {
@@ -163,18 +176,18 @@ fn creation_past_the_queue_limit_waits_for_room() {
     });
     let super::PipelineWait::Deferred(holder) = holder else { panic!("the holder should outlive the deadline") };
     // The only slot is busy, so this fills the one queue entry.
-    let first = super::run_for("first queued", std::time::Duration::from_secs(5), || 2);
+    let first = super::run_for("first queued", std::time::Duration::from_secs(5), 1, || 2);
     let super::PipelineWait::Deferred(first) = first else { panic!("a compile past the cap should be queued") };
     std::thread::scope(|scope| {
         let (returned, creation) = std::sync::mpsc::channel();
         scope.spawn(move || {
-            let wait = super::run_for("second queued", std::time::Duration::from_secs(5), || 3);
+            let wait = super::run_for("second queued", std::time::Duration::from_secs(5), 1, || 3);
             let super::PipelineWait::Deferred(second) = wait else { panic!("expected a queued compile") };
             returned.send(()).unwrap();
             assert_eq!(second.wait(), Some(3));
         });
         let while_full = creation.recv_timeout(std::time::Duration::from_millis(250));
-        let queued_while_full = super::queue().len();
+        let queued_while_full = super::queue().jobs.len();
         // Release before asserting, so a failure reports instead of hanging.
         let (lock, wake) = &*gate;
         *lock.lock().unwrap_or_else(|error| error.into_inner()) = true;
@@ -199,7 +212,7 @@ fn dropping_a_completed_deferred_pipeline_releases_its_result() {
     let (release, gate) = std::sync::mpsc::channel();
     let result = std::sync::Arc::new(7);
     let retained = std::sync::Arc::downgrade(&result);
-    let wait = super::run_for("release result", std::time::Duration::from_millis(20), move || {
+    let wait = super::run_for("release result", std::time::Duration::from_millis(20), 0, move || {
         gate.recv_timeout(std::time::Duration::from_secs(1)).unwrap();
         result
     });
@@ -225,7 +238,7 @@ fn compiles_past_the_cap_are_queued_and_still_run() {
     let gate = std::sync::Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
     for _ in 0..2 {
         let gate_in_job = std::sync::Arc::clone(&gate);
-        let wait = super::run_for("hold", std::time::Duration::from_millis(30), move || {
+        let wait = super::run_for("hold", std::time::Duration::from_millis(30), 0, move || {
             let (lock, wake) = &*gate_in_job;
             let mut open = lock.lock().unwrap_or_else(|error| error.into_inner());
             while !*open {
@@ -237,7 +250,7 @@ fn compiles_past_the_cap_are_queued_and_still_run() {
     let ran = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let ran_in_job = std::sync::Arc::clone(&ran);
     let started = std::time::Instant::now();
-    let wait = super::run_for("ninth", std::time::Duration::from_secs(5), move || {
+    let wait = super::run_for("ninth", std::time::Duration::from_secs(5), 0, move || {
         ran_in_job.store(true, std::sync::atomic::Ordering::SeqCst);
     });
     assert!(matches!(wait, super::PipelineWait::Deferred(_)));

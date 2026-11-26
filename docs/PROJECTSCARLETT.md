@@ -95,9 +95,9 @@ waits only
 `TUXBOX_PIPELINE_DEADLINE` seconds (default 2). After that the game gets a
 stand-in with the same root signature and the compile continues in the
 background. A command list that binds the pipeline waits there for the compiled
-result, so no work is dropped. At most `TUXBOX_PIPELINE_MAX_QUEUED` compiles
-(default 64) wait for a background slot, because each one holds a copy of its
-shader; past that, creation waits for room. `TUXBOX_PIPELINE_DEADLINE=0` waits
+result, so no work is dropped. Compiles waiting for a background slot
+hold copies of their shaders, so once they hold `TUXBOX_PIPELINE_QUEUE_MIB`
+(default 256) creation waits for room. `TUXBOX_PIPELINE_DEADLINE=0` waits
 instead. `TUXBOX_LARGE_COMPILES` sets the number,
 and `0` removes the limit. The first launch can still spend a long time loading.
 

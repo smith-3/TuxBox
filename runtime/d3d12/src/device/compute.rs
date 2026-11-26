@@ -406,6 +406,8 @@ unsafe fn create_pipeline_x_inner(
     let trace_source = crate::commands::queue_trace::enabled().then(|| compute_source_kind(bytes));
     let attempt = if translation.is_some() { "translated" } else { "original" };
     let late = LateFailure::default();
+    // The translated and the original shader copies the queued compile holds.
+    let queued_bytes = code.len() + retry.as_ref().map_or(0, Vec::len);
     let compile = {
         let late = late.clone();
         let device = this.native.clone();
@@ -442,7 +444,7 @@ unsafe fn create_pipeline_x_inner(
     // the dispatch that precedes the account-picker draws was dropped. A
     // pipeline still compiling now keeps its layout and a stand-in, and command
     // lists wait for the compiled pipeline when they first bind it.
-    let (native, pending) = match crate::big_stack::run_deadline(&label, compile) {
+    let (native, pending) = match crate::big_stack::run_deadline(&label, queued_bytes, compile) {
         crate::big_stack::PipelineWait::Ready(result) => (result, None),
         crate::big_stack::PipelineWait::Deferred(pending) => match null_native(this, signature.as_ref(), desc) {
             Some(stand_in) => {
@@ -499,7 +501,7 @@ pub(super) fn large_deferred(
     late: LateFailure,
 ) -> crate::big_stack::PipelineWait<windows::core::Result<ID3D12PipelineState>> {
     let name = label.to_owned();
-    crate::big_stack::run_deadline(label, move || {
+    crate::big_stack::run_deadline(label, shader.len(), move || {
         let _slot = crate::compile_gate::large_compile(shader.len(), |slots| {
             crate::diagnostics::log(&format!("{name} waits for one of {slots} large compile slots"));
         });

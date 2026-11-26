@@ -48,7 +48,7 @@ The launcher sets these for a Proton or Wine launch. A value you set yourself is
 | `TUXBOX_LARGE_COMPILES` | `4` | Large compute pipelines compiling at once; `0` removes the limit |
 | `TUXBOX_PIPELINE_DEADLINE` | `2` | Seconds pipeline creation waits for the driver before the compile continues in the background; `0` waits |
 | `TUXBOX_PIPELINE_MAX_LIVE` | one per CPU core, 2 to 16 | Background pipeline compiles at once, 1 to 16 |
-| `TUXBOX_PIPELINE_MAX_QUEUED` | `64` | Background compiles waiting for a slot, 1 to 4096; past it pipeline creation waits |
+| `TUXBOX_PIPELINE_QUEUE_MIB` | `256` | MiB of shader copies that background compiles waiting for a slot may hold, 1 to 16384; past it pipeline creation waits |
 | `TUXBOX_MESH_COMPILES` | off | Native mesh pipelines created at once |
 | `TUXBOX_MESH_LAZY` | off | `1` creates mesh pipelines when a command list first binds them |
 | `TUXBOX_NULL_PIPELINES` | on | `0` fails unsupported pipelines instead of giving empty stand-ins |

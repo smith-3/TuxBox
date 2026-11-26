@@ -187,7 +187,8 @@ impl<R: Clone> Pending<R> {
 
 /// Wait up to `TUXBOX_PIPELINE_DEADLINE` seconds (default 2). `0` waits until
 /// the driver returns. Past the deadline the helper is detached, not cancelled.
-pub(crate) fn run_deadline<R, F>(label: &str, job: F) -> PipelineWait<R>
+/// `bytes` is what the job holds while it waits in the queue (see `enqueue`).
+pub(crate) fn run_deadline<R, F>(label: &str, bytes: usize, job: F) -> PipelineWait<R>
 where
     R: Send + 'static,
     F: FnOnce() -> R + Send + 'static,
@@ -207,7 +208,7 @@ where
             )
         });
     }
-    run_for(label, deadline, job)
+    run_for(label, deadline, bytes, job)
 }
 
 fn note_first_use(label: &str, waited: std::time::Duration) {
@@ -263,7 +264,7 @@ fn compile_limit(configured: Option<&str>, cpus: usize) -> usize {
         .unwrap_or_else(|| cpus.clamp(2, 16))
 }
 
-fn run_for<R, F>(label: &str, deadline: std::time::Duration, job: F) -> PipelineWait<R>
+fn run_for<R, F>(label: &str, deadline: std::time::Duration, bytes: usize, job: F) -> PipelineWait<R>
 where
     R: Send + 'static,
     F: FnOnce() -> R + Send + 'static,
@@ -294,7 +295,7 @@ where
         delivery.finish(value);
     };
     if !reserve_slot() {
-        enqueue(label, cell.id, deliver);
+        enqueue(label, cell.id, bytes, deliver);
         // A slot may have freed between the reservation attempt and the push.
         on_slot_released();
         note_deferred(label, None);
@@ -352,27 +353,29 @@ fn note_deferred(label: &str, waited: Option<std::time::Duration>) {
 
 /// Each queued compile owns copies of its shader bytes and root signature, and
 /// a title creates tens of thousands of pipelines faster than the driver
-/// compiles them. Past `max_queued` the creating thread waits for a queued
-/// compile to start, so memory stays bounded and `max_live` still caps the
-/// driver's concurrent compiles.
-fn enqueue<F>(label: &str, id: u64, job: F)
+/// compiles them. Once the queued compiles hold `queue_budget` bytes, the
+/// creating thread waits for one to start, so memory stays bounded while
+/// small compiles still queue freely, and `max_live` still caps the driver's
+/// concurrent compiles. A compile larger than the budget queues alone.
+fn enqueue<F>(label: &str, id: u64, bytes: usize, job: F)
 where
     F: FnOnce() + Send + 'static,
 {
-    let mut job = Some(Queued { label: label.to_string(), id, job: Box::new(job) });
+    let mut job = Some(Queued { label: label.to_string(), id, bytes, job: Box::new(job) });
     let mut _pause = None;
     loop {
         {
             let mut queued = queue();
-            if queued.len() < max_queued() {
+            if queued.has_room(bytes, queue_budget()) {
                 queued.push_back(job.take().expect("queued once"));
                 return;
             }
             if _pause.is_none() {
                 static FULL: std::sync::Once = std::sync::Once::new();
-                crate::diagnostics::log_once(&FULL, || {
-                    format!("pipeline compile queue holds {} compiles; creation waits for room", queued.len())
-                });
+                crate::diagnostics::log_once(&FULL, || format!(
+                    "pipeline compile queue holds {} compiles in {} MiB; creation waits for room",
+                    queued.jobs.len(), queued.bytes >> 20
+                ));
                 _pause = Some(crate::title_watchdog::pause());
             }
             // Bounded, so a slot released without a pump still gets one below.
@@ -385,36 +388,38 @@ where
 /// Signalled whenever a compile leaves the queue.
 static QUEUE_ROOM: std::sync::Condvar = std::sync::Condvar::new();
 
-static MAX_QUEUED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+/// Bytes queued compiles may hold. `0` means not chosen yet; tests store one.
+static QUEUE_BUDGET: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
-fn max_queued() -> usize {
-    let current = MAX_QUEUED.load(std::sync::atomic::Ordering::Relaxed);
+fn queue_budget() -> usize {
+    let current = QUEUE_BUDGET.load(std::sync::atomic::Ordering::Relaxed);
     if current != 0 {
         return current;
     }
-    let configured = std::env::var("TUXBOX_PIPELINE_MAX_QUEUED").ok();
-    let chosen = queue_limit(configured.as_deref());
-    match MAX_QUEUED.compare_exchange(0, chosen, std::sync::atomic::Ordering::AcqRel, std::sync::atomic::Ordering::Acquire) {
+    let configured = std::env::var("TUXBOX_PIPELINE_QUEUE_MIB").ok();
+    let chosen = queue_budget_bytes(configured.as_deref());
+    match QUEUE_BUDGET.compare_exchange(0, chosen, std::sync::atomic::Ordering::AcqRel, std::sync::atomic::Ordering::Acquire) {
         Ok(_) => chosen,
         Err(existing) => existing,
     }
 }
 
-fn queue_limit(configured: Option<&str>) -> usize {
-    const DEFAULT: usize = 64;
+fn queue_budget_bytes(configured: Option<&str>) -> usize {
+    const DEFAULT_MIB: usize = 256;
     configured
         .and_then(|text| text.trim().parse().ok())
-        .filter(|value| (1..=4096).contains(value))
-        .unwrap_or(DEFAULT)
+        .filter(|mib| (1..=16384).contains(mib))
+        .unwrap_or(DEFAULT_MIB)
+        << 20
 }
 
 /// Give a pipeline needed by a command list the next available compile slot.
 fn prioritize(id: u64) {
     let mut queue = queue();
-    if let Some(index) = queue.iter().position(|queued| queued.id == id)
-        && let Some(job) = queue.remove(index)
+    if let Some(index) = queue.jobs.iter().position(|queued| queued.id == id)
+        && let Some(job) = queue.jobs.remove(index)
     {
-        queue.push_front(job);
+        queue.jobs.push_front(job);
     }
 }
 
@@ -441,12 +446,41 @@ fn join_or_resume(handle: std::thread::JoinHandle<()>) {
 struct Queued {
     label: String,
     id: u64,
+    bytes: usize,
     job: Box<dyn FnOnce() + Send>,
 }
 
-fn queue() -> std::sync::MutexGuard<'static, std::collections::VecDeque<Queued>> {
-    static QUEUE: std::sync::Mutex<std::collections::VecDeque<Queued>> =
-        std::sync::Mutex::new(std::collections::VecDeque::new());
+/// Queued compiles and the bytes they hold.
+struct Queue {
+    jobs: std::collections::VecDeque<Queued>,
+    bytes: usize,
+}
+
+impl Queue {
+    fn has_room(&self, bytes: usize, budget: usize) -> bool {
+        self.jobs.is_empty() || self.bytes.saturating_add(bytes) <= budget
+    }
+
+    fn push_back(&mut self, job: Queued) {
+        self.bytes += job.bytes;
+        self.jobs.push_back(job);
+    }
+
+    fn pop_front(&mut self) -> Option<Queued> {
+        let job = self.jobs.pop_front()?;
+        self.bytes -= job.bytes;
+        Some(job)
+    }
+
+    #[cfg(test)]
+    fn is_empty(&self) -> bool {
+        self.jobs.is_empty()
+    }
+}
+
+fn queue() -> std::sync::MutexGuard<'static, Queue> {
+    static QUEUE: std::sync::Mutex<Queue> =
+        std::sync::Mutex::new(Queue { jobs: std::collections::VecDeque::new(), bytes: 0 });
     QUEUE.lock().unwrap_or_else(|error| error.into_inner())
 }
 
@@ -499,7 +533,7 @@ fn on_slot_released() {
         start_one_queued();
         PUMP.store(false, std::sync::atomic::Ordering::Release);
         // A submission or slot release may have arrived while the pump was active.
-        if live_counter().load(std::sync::atomic::Ordering::Acquire) >= max_live() || queue().is_empty() {
+        if live_counter().load(std::sync::atomic::Ordering::Acquire) >= max_live() || queue().jobs.is_empty() {
             return;
         }
     }
