@@ -90,10 +90,43 @@ struct Mip {
     bytes: u64,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) struct MipDigest {
+    len: usize,
+    lo: u64,
+    hi: u64,
+}
+
+/// Fast 128-bit content digest over a mip snapshot. Storing 24 bytes per mip
+/// instead of a full `Vec<u8>` copy avoids retaining gigabytes of duplicate
+/// texture data while still detecting partial writes and all-zero rewrites.
+pub(super) fn mip_digest(bytes: &[u8]) -> MipDigest {
+    let mut lo: u64 = 0xcbf2_9ce4_8422_2325 ^ (bytes.len() as u64);
+    let mut hi: u64 = 0x9e37_79b9_7f4a_7c15 ^ (bytes.len() as u64).rotate_left(32);
+    let chunks = bytes.chunks_exact(8);
+    let rem = chunks.remainder();
+    for chunk in chunks {
+        let word = u64::from_le_bytes(chunk.try_into().unwrap());
+        lo = (lo ^ word).wrapping_mul(0x1000_0000_01b3);
+        hi = hi.wrapping_add(word ^ 0xa076_1d64_78bd_642f).rotate_left(27).wrapping_mul(0x94d0_49bb_1331_11eb);
+    }
+    if !rem.is_empty() {
+        let mut tail = [0u8; 8];
+        tail[..rem.len()].copy_from_slice(rem);
+        let word = u64::from_le_bytes(tail);
+        lo = (lo ^ word).wrapping_mul(0x1000_0000_01b3);
+        hi = hi.wrapping_add(word ^ 0xe703_7ed1_a0b4_28db).rotate_left(27).wrapping_mul(0x94d0_49bb_1331_11eb);
+    }
+    lo ^= lo >> 33;
+    hi ^= hi >> 33;
+    MipDigest { len: bytes.len(), lo, hi }
+}
+
 #[derive(Default)]
 struct Contents {
-    // An exact copy makes writes to shared pages and all-zero rewrites observable.
-    previous: Vec<Vec<u8>>,
+    // A content digest makes writes to shared pages and all-zero rewrites
+    // observable without retaining a duplicate CPU copy of every placed texture.
+    previous: Vec<Option<MipDigest>>,
     uploaded: u64,
     readers: Vec<(ID3D12Fence, u64)>,
 }
@@ -309,7 +342,7 @@ impl Texture {
             });
         }
         let contents = Mutex::new(Contents {
-            previous: vec![Vec::new(); mips.len()],
+            previous: vec![None; mips.len()],
             ..Default::default()
         });
         Ok(Arc::new(Self {
@@ -355,14 +388,16 @@ impl Texture {
         let mut contents = lock(&self.contents);
         for (level, mip) in self.mips.iter().enumerate() {
             if !self.snapshot_mip(mip, scratch)? {
-                contents.previous[level].clear();
+                contents.previous[level] = None;
                 continue;
             }
-            if *scratch != contents.previous[level] {
+            let digest = mip_digest(scratch);
+            if contents.previous[level] != Some(digest) {
                 changes.push(upload::Change {
                     texture: self.clone(),
                     level,
                     bytes: std::mem::take(scratch),
+                    digest,
                 });
             }
         }
@@ -412,6 +447,7 @@ struct PlacementMemory {
     // made before the title creates a second resource proxy for it.
     images: Arc<Images>,
     submissions: Mutex<Option<Submissions>>,
+    readback_pool: Arc<writeback::ReadbackPool>,
     failed: Arc<AtomicI32>,
 }
 
@@ -736,10 +772,16 @@ pub(crate) unsafe fn submit(
             .try_reserve(writes.len())
             .map_err(|_| E_OUTOFMEMORY)?;
         let worker = access.worker(&device.native, &placements.memory.failed)?;
-        let readback =
-            writeback::Readback::record(&device.native, unsafe { queue.GetDesc() }.Type, writes)?;
+        worker.wait_for_budget();
+        let readback = writeback::Readback::record(
+            &device.native,
+            unsafe { queue.GetDesc() }.Type,
+            writes,
+            &placements.memory.readback_pool,
+        )?;
         Some((worker, readback))
     };
+    let held = holds.is_some();
     if let Some(waits) = &holds {
         held::register(reader, tick, waits);
     }
@@ -755,7 +797,7 @@ pub(crate) unsafe fn submit(
         // Retry once to retire it, or retain it for the lifetime of a live driver.
         if let Some((worker, readback)) = publication {
             if unsafe { queue.Signal(reader, tick) }.is_ok() {
-                worker.enqueue(readback, reader, tick)?;
+                worker.enqueue(readback, reader, tick, held)?;
             } else if unsafe { device.native.GetDeviceRemovedReason() }.is_ok() {
                 std::mem::forget(readback);
             }
@@ -763,7 +805,7 @@ pub(crate) unsafe fn submit(
         return Err(error);
     }
     if let Some((worker, readback)) = publication {
-        if let Err(error) = worker.enqueue(readback, reader, tick) {
+        if let Err(error) = worker.enqueue(readback, reader, tick, held) {
             transfer.failed = Some(error.code());
             return Err(error);
         }

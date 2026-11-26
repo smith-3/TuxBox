@@ -301,12 +301,12 @@ fn create_native_mesh(
 
 /// Recipe bytes stored once by content, so thousands of deferred pipelines
 /// that share shaders keep one copy on disk and none in memory.
-mod spool {
+pub(super) mod spool {
     use std::path::PathBuf;
     use std::sync::OnceLock;
 
     #[derive(Clone)]
-    pub(super) struct Entry {
+    pub(in crate::device) struct Entry {
         digest: String,
         len: usize,
     }
@@ -319,7 +319,7 @@ mod spool {
         }).as_ref()
     }
 
-    pub(super) fn store(bytes: &[u8]) -> Option<Entry> {
+    pub(in crate::device) fn store(bytes: &[u8]) -> Option<Entry> {
         let directory = directory()?;
         let digest = super::shader_cache::source_digest(bytes)?;
         let path = directory.join(format!("{digest}.bin"));
@@ -341,7 +341,7 @@ mod spool {
 
     impl Entry {
         /// The stored bytes, if they are still there and unchanged.
-        pub(super) fn load(&self) -> Option<Vec<u8>> {
+        pub(in crate::device) fn load(&self) -> Option<Vec<u8>> {
             let bytes = std::fs::read(directory()?.join(format!("{}.bin", self.digest))).ok()?;
             (bytes.len() == self.len && super::shader_cache::source_digest(&bytes)? == self.digest).then_some(bytes)
         }

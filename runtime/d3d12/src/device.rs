@@ -40,6 +40,7 @@ mod dxc;
 mod mesh_lazy;
 mod mesh_pipeline;
 mod mesh_table;
+mod pipeline_lazy;
 pub(crate) mod depth;
 mod descriptor_copy;
 pub(crate) mod descriptor_paging;

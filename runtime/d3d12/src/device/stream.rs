@@ -118,6 +118,8 @@ unsafe fn create(
     let mut original = [None; 8];
     let mut fields = [None; 8];
     let mut root_record = None;
+    let mut input_layout_record = None;
+    let mut view_instancing_record = None;
     let mut guest_root = None;
     let mut node_mask = 0;
     let mut seen = 0u32;
@@ -194,8 +196,16 @@ unsafe fn create(
                     unsafe { (*payload.cast::<D3D12_STREAM_OUTPUT_DESC>()).NumEntries != 0 }
             }
             8 => blend = payload.cast(),
-            12 => foreign_pointers |= unsafe { (*payload.cast::<D3D12_INPUT_LAYOUT_DESC>()).NumElements != 0 },
-            22 => foreign_pointers |= unsafe { (*payload.cast::<D3D12_VIEW_INSTANCING_DESC>()).ViewInstanceCount != 0 },
+            12 => {
+                let layout_desc = payload.cast::<D3D12_INPUT_LAYOUT_DESC>();
+                input_layout_record = Some(layout_desc);
+                foreign_pointers |= unsafe { (*layout_desc).NumElements != 0 };
+            }
+            22 => {
+                let view_desc = payload.cast::<D3D12_VIEW_INSTANCING_DESC>();
+                view_instancing_record = Some(view_desc);
+                foreign_pointers |= unsafe { (*view_desc).ViewInstanceCount != 0 };
+            }
             14 if unsafe { payload.cast::<i32>().read() } == rectangle::PIPELINE_TYPE => {
                 rectangles = true;
                 unsafe {
@@ -477,6 +487,32 @@ unsafe fn create(
         pPipelineStateSubobjectStream: output.cast(),
     };
     let label = stream_label(&hashes);
+    // With TUXBOX_PIPELINE_LAZY=1, non-mesh streams (compute and graphics) are
+    // spooled and materialized on first bind, matching TUXBOX_MESH_LAZY=1.
+    if fields[7].is_none()
+        && !stream_output
+        && super::pipeline_lazy::enabled()
+        && let Some(placeholder) = super::mesh_lazy::placeholder(device)
+        && let Some(lazy) = unsafe {
+            super::pipeline_lazy::LazyStream::defer(
+                host,
+                output,
+                size,
+                &fields,
+                root_record,
+                input_layout_record,
+                view_instancing_record,
+                rectangles,
+                geometry_record,
+                &original,
+                &hashes,
+                label.clone(),
+            )
+        }
+    {
+        pipeline.lazy = Some(super::pipeline_lazy::LazyPipeline::Stream(lazy));
+        return Ok(placeholder);
+    }
     // A large translated compute program can compile for longer than any load
     // will wait. It runs on a detached, queued compile with a deadline; past
     // that the title gets a stand-in until a command list first binds it, as on
@@ -543,7 +579,7 @@ unsafe fn create(
             && let Some(placeholder) = super::mesh_lazy::placeholder(device)
             && let Some(lazy) = super::mesh_lazy::LazyMesh::defer(&recipe, host)
         {
-            pipeline.lazy = Some(lazy);
+            pipeline.lazy = Some(super::pipeline_lazy::LazyPipeline::Mesh(lazy));
             return Ok(placeholder);
         }
         let created = recipe.materialize(host);

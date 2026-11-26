@@ -1,7 +1,7 @@
 //! Publish the GPU's texels to the original Xbox pages before the guest fence.
 use super::{Texture, committed, lock};
 use core::{mem::ManuallyDrop, ops::Range};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use windows::Win32::Foundation::{
     E_ACCESSDENIED, E_FAIL, E_INVALIDARG, E_OUTOFMEMORY, HANDLE, NTSTATUS,
 };
@@ -10,6 +10,71 @@ use windows::Win32::System::{
     Diagnostics::Debug::WriteProcessMemory, Memory::*, Threading::GetCurrentProcess,
 };
 use windows::core::{Interface, Result};
+
+/// Pool reusable power-of-two `D3D12_HEAP_TYPE_READBACK` buffers across
+/// submissions so thousands of texture publications do not fragment or bloat
+/// vkd3d-proton's pinned system-memory allocator.
+const MIN_POOLED_BUFFER: u64 = 1024 * 1024;
+const MAX_POOLED_BUFFER: u64 = 64 * 1024 * 1024;
+const MAX_POOLED_TOTAL: u64 = 128 * 1024 * 1024;
+
+#[derive(Default)]
+pub(super) struct ReadbackPool {
+    buffers: Mutex<Vec<(ID3D12Resource, u64)>>,
+}
+
+impl ReadbackPool {
+    fn acquire(&self, device: &ID3D12Device, required: u64) -> Result<(ID3D12Resource, u64)> {
+        let bucket = if required <= MAX_POOLED_BUFFER {
+            required.max(MIN_POOLED_BUFFER).next_power_of_two()
+        } else {
+            required
+        };
+        if required <= MAX_POOLED_BUFFER {
+            let mut pool = lock(&self.buffers);
+            if let Some((index, _)) = pool
+                .iter()
+                .enumerate()
+                .filter(|(_, (_, cap))| *cap >= required && *cap <= bucket.saturating_mul(2))
+                .min_by_key(|(_, (_, cap))| *cap)
+            {
+                return Ok(pool.swap_remove(index));
+            }
+        }
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+            Width: bucket,
+            Height: 1,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+            ..Default::default()
+        };
+        let buffer = committed(
+            device,
+            D3D12_HEAP_TYPE_READBACK,
+            &desc,
+            D3D12_RESOURCE_STATE_COPY_DEST,
+            None,
+        )?;
+        Ok((buffer, bucket))
+    }
+
+    fn release(&self, buffer: ID3D12Resource, capacity: u64) {
+        if capacity > MAX_POOLED_BUFFER {
+            return;
+        }
+        let mut pool = lock(&self.buffers);
+        let current: u64 = pool.iter().map(|(_, cap)| *cap).sum();
+        if current.saturating_add(capacity) <= MAX_POOLED_TOTAL {
+            pool.push((buffer, capacity));
+        }
+    }
+}
 
 #[link(name = "ntdll")]
 unsafe extern "system" {
@@ -26,6 +91,8 @@ pub(super) struct Readback {
     pub(super) list: ID3D12CommandList,
     _allocator: ID3D12CommandAllocator,
     buffer: ID3D12Resource,
+    capacity: u64,
+    pool: Arc<ReadbackPool>,
     size: usize,
     // One footprint offset per mip (including array slices) in the readback buffer.
     textures: Vec<(Arc<Texture>, Vec<u64>)>,
@@ -36,6 +103,7 @@ impl Readback {
         device: &ID3D12Device,
         kind: D3D12_COMMAND_LIST_TYPE,
         writers: &[Arc<Texture>],
+        pool: &Arc<ReadbackPool>,
     ) -> Result<Self> {
         let mut total = 0u64;
         let mut textures = Vec::new();
@@ -54,26 +122,7 @@ impl Readback {
             .ok()
             .filter(|&n| n <= isize::MAX as usize)
             .ok_or(E_OUTOFMEMORY)?;
-        let desc = D3D12_RESOURCE_DESC {
-            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
-            Width: total,
-            Height: 1,
-            DepthOrArraySize: 1,
-            MipLevels: 1,
-            SampleDesc: DXGI_SAMPLE_DESC {
-                Count: 1,
-                Quality: 0,
-            },
-            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
-            ..Default::default()
-        };
-        let buffer = committed(
-            device,
-            D3D12_HEAP_TYPE_READBACK,
-            &desc,
-            D3D12_RESOURCE_STATE_COPY_DEST,
-            None,
-        )?;
+        let (buffer, capacity) = pool.acquire(device, total)?;
         // SAFETY: the new allocator and command list belong to this device;
         // both, the buffer and the source textures are retained to completion.
         let allocator = unsafe { device.CreateCommandAllocator(kind)? };
@@ -111,9 +160,15 @@ impl Readback {
             list: list.cast()?,
             _allocator: allocator,
             buffer,
+            capacity,
+            pool: pool.clone(),
             size,
             textures,
         })
+    }
+
+    pub(super) fn byte_size(&self) -> usize {
+        self.size
     }
 
     /// Called after the native fence covering every footprint has completed.
@@ -141,7 +196,7 @@ impl Readback {
                 // region covers this mip. Recheck on every publication, since
                 // the guest can commit backing after creating the texture.
                 if region.0 - address >= size && !mapped_region(&region.1) {
-                    state.previous[level].clear();
+                    state.previous[level] = None;
                     continue;
                 }
                 tiled.clear();
@@ -174,6 +229,7 @@ impl Readback {
                 })?;
                 // Coalesce adjacent texels in physical address order. Never
                 // write row padding, partial-tile holes or neighbouring mips.
+                let single_mapped = region.0 - address >= size && mapped_region(&region.1);
                 if dense {
                     write_mapped(address, &tiled, 0..size, &mut region)?;
                 } else {
@@ -186,12 +242,21 @@ impl Readback {
                 }
                 // Include padding from guest memory in the comparison baseline:
                 // upload::refresh compares the entire physical mip snapshot.
-                texture.snapshot_mip(mip, &mut state.previous[level])?;
+                // For a dense mip written into a single mapped region, `tiled`
+                // already matches guest memory byte-for-byte.
+                state.previous[level] = if dense && single_mapped {
+                    Some(super::mip_digest(&tiled))
+                } else {
+                    texture
+                        .snapshot_mip(mip, &mut tiled)?
+                        .then(|| super::mip_digest(&tiled))
+                };
             }
             Ok(())
         });
         // SAFETY: no CPU writes were made to the GPU readback allocation.
         unsafe { self.buffer.Unmap(0, Some(&D3D12_RANGE::default())) };
+        self.pool.release(self.buffer, self.capacity);
         result
     }
 }

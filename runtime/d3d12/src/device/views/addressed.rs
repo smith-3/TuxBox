@@ -342,7 +342,9 @@ pub(in super::super) unsafe extern "system" fn address_uav(
     let stride = element_stride(view.Format.0, buffer.StructureByteStride)
         .unwrap_or_else(|| fail_call(format_args!("unsupported address UAV format {}", view.Format.0)));
     rebase_view((0, resource_desc.Width), view.Format.0, buffer.StructureByteStride, buffer.FirstElement, buffer.NumElements);
-    let entry = match buffer_at(device, desc.address, resource_desc.Width, stride, true, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) {
+    let mode = AddressViews::get(device);
+    let placement_stride = if mode.supports(view.Format.0, buffer.Flags.0, buffer.StructureByteStride, buffer.NumElements) { 1 } else { stride };
+    let entry = match buffer_at(device, desc.address, resource_desc.Width, placement_stride, true, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) {
         Ok(Some(entry)) => entry,
         Ok(None) => fail_call(format_args!("import UAV at {:#x} produced no buffer ({} bytes)", desc.address, resource_desc.Width)),
         Err(error) => fail_call(format_args!(
@@ -351,10 +353,12 @@ pub(in super::super) unsafe extern "system" fn address_uav(
         )),
     };
     let offset = entry.offset(desc.address);
-    if !offset.is_multiple_of(u64::from(stride)) {
-        fail_call(format_args!("address UAV at {:#x} starts {offset} bytes into its buffer, not a whole {stride}-byte element", desc.address));
-    }
-    view.Anonymous.Buffer.FirstElement = buffer.FirstElement + offset / u64::from(stride);
+    let byte_view = if offset.is_multiple_of(u64::from(stride)) {
+        view.Anonymous.Buffer.FirstElement = buffer.FirstElement + offset / u64::from(stride);
+        None
+    } else {
+        Some((mode, offset, stride))
+    };
     if let Some(raw) = super::super::allocation::packed_uav_raw_format(view.Format)
         && !super::super::dxgi::supports_native_packed_uav(device, view.Format)
     {
@@ -364,5 +368,10 @@ pub(in super::super) unsafe extern "system" fn address_uav(
     device.state.imported_views.store(handle.ptr, Some(DescriptorBacking::Registered { _address: entry.clone() }));
     device.state.blas.views.store(handle.ptr, None);
     device.state.placements.views.set(handle.ptr, None, true);
-    unsafe { device.native.CreateUnorderedAccessView(Some(&entry.native), None, Some(&view), handle) };
+    if let Some((mode, offset, stride)) = byte_view {
+        mode.create_uav(device, &entry.native, None, view, offset, stride, handle)
+            .unwrap_or_else(|e| fail_call(format_args!("byte-offset UAV at {:#x} offset={offset} stride={stride}: {:?}", desc.address, e.code())));
+    } else {
+        unsafe { device.native.CreateUnorderedAccessView(Some(&entry.native), None, Some(&view), handle) };
+    }
 }

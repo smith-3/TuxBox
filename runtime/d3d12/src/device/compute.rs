@@ -33,9 +33,9 @@ pub(crate) struct PipelineData {
     /// A driver compile that outlived creation. Until it finishes, the proxy
     /// holds a resource-free stand-in with the same root signature.
     pub(crate) pending: Option<crate::big_stack::Pending<windows::core::Result<ID3D12PipelineState>>>,
-    /// A mesh pipeline created on first bind. The proxy wraps a shared
-    /// placeholder until then (see `mesh_lazy`).
-    pub(crate) lazy: Option<super::mesh_lazy::LazyMesh>,
+    /// A pipeline created on first bind. The proxy wraps a shared
+    /// placeholder until then (see `mesh_lazy` and `pipeline_lazy`).
+    pub(crate) lazy: Option<super::pipeline_lazy::LazyPipeline>,
 }
 
 impl Pipeline {
@@ -95,7 +95,7 @@ pub(super) static PIPELINE: Slots<14> = {
 unsafe extern "system" fn get_private(this: &Pipeline, key: *const GUID, size: *mut u32, data: *mut c_void) -> HRESULT {
     let Some(key) = (unsafe { key.as_ref() }) else { return E_INVALIDARG };
     match &this.state.lazy {
-        Some(lazy) => unsafe { lazy.private.get(key, size, data) },
+        Some(lazy) => unsafe { lazy.private().get(key, size, data) },
         None => {
             let native: &ID3D12Object = (&this.native).into();
             unsafe { (native.vtable().GetPrivateData)(native.as_raw(), key, size, data) }
@@ -106,7 +106,7 @@ unsafe extern "system" fn get_private(this: &Pipeline, key: *const GUID, size: *
 unsafe extern "system" fn set_private(this: &Pipeline, key: *const GUID, size: u32, data: *const c_void) -> HRESULT {
     let Some(key) = (unsafe { key.as_ref() }) else { return E_INVALIDARG };
     match &this.state.lazy {
-        Some(lazy) => unsafe { lazy.private.set(key, size, data) },
+        Some(lazy) => unsafe { lazy.private().set(key, size, data) },
         None => {
             let native: &ID3D12Object = (&this.native).into();
             unsafe { (native.vtable().SetPrivateData)(native.as_raw(), key, size, data) }
@@ -117,7 +117,7 @@ unsafe extern "system" fn set_private(this: &Pipeline, key: *const GUID, size: u
 unsafe extern "system" fn set_private_interface(this: &Pipeline, key: *const GUID, object: *mut c_void) -> HRESULT {
     let Some(key) = (unsafe { key.as_ref() }) else { return E_INVALIDARG };
     match &this.state.lazy {
-        Some(lazy) => unsafe { lazy.private.set_interface(key, object) },
+        Some(lazy) => unsafe { lazy.private().set_interface(key, object) },
         None => {
             let native: &ID3D12Object = (&this.native).into();
             unsafe { (native.vtable().SetPrivateDataInterface)(native.as_raw(), key, object) }
@@ -406,6 +406,35 @@ unsafe fn create_pipeline_x_inner(
     let trace_source = crate::commands::queue_trace::enabled().then(|| compute_source_kind(bytes));
     let attempt = if translation.is_some() { "translated" } else { "original" };
     let late = LateFailure::default();
+    if super::pipeline_lazy::enabled()
+        && let Some(placeholder) = super::mesh_lazy::placeholder(this)
+        && let Some(lazy) = super::pipeline_lazy::LazyCompute::defer(
+            &this.native,
+            signature.clone(),
+            code,
+            retry.as_deref(),
+            desc.NodeMask,
+            desc.Flags,
+            label.clone(),
+        )
+    {
+        return unsafe {
+            wrap_pageable(
+                Ok(placeholder),
+                &PIPELINE,
+                this,
+                PipelineData {
+                    scene_root,
+                    reflected,
+                    compute_threads,
+                    sampler_root,
+                    lazy: Some(super::pipeline_lazy::LazyPipeline::Compute(lazy)),
+                    ..Default::default()
+                },
+                out,
+            )
+        };
+    }
     // The translated and the original shader copies the queued compile holds.
     let queued_bytes = code.len() + retry.as_ref().map_or(0, Vec::len);
     let compile = {
@@ -603,7 +632,7 @@ fn trace_compile_failure(
 /// The guest descriptor can be released as soon as the caller returns. A
 /// deadline does that while the driver is still compiling, so the bytes and
 /// the root signature in that descriptor must not be the ones the driver reads.
-fn owned_compile(
+pub(super) fn owned_compile(
     device: ID3D12Device,
     root: Option<ID3D12RootSignature>,
     shader: Vec<u8>,
