@@ -163,12 +163,13 @@ pub(super) unsafe extern "system" fn create_list_x(
         Ok(initial) => initial,
         Err(error) => return error,
     };
+    let initial_native = initial.map(compute::Pipeline::bound_native);
     let list: ID3D12GraphicsCommandList = match unsafe {
         this.native.CreateCommandList(
             desc.node_mask,
             desc.kind,
             &allocator.native,
-            initial.map(|p| &p.native),
+            initial_native.as_ref(),
         )
     } {
         Ok(list) => list,

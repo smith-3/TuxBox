@@ -89,12 +89,16 @@ its memory limit and swap and stopped progressing. TuxBox therefore lets at most
 four translated compute shaders of 512 KiB or more compile at once; the others
 wait. Smaller shaders are not affected.
 
-Some of these compiles do not finish within any usable load time. A large
-translated compute pipeline (device slot 62 or 86) therefore waits only
-`TUXBOX_PIPELINE_DEADLINE` seconds (default 20). After that the game gets an
-empty stand-in and the compile continues in the background. The stand-in does no
-work, so whatever that program computes is missing until a later launch finds the
-compiled result in the driver cache. `TUXBOX_PIPELINE_DEADLINE=0` waits instead. `TUXBOX_LARGE_COMPILES` sets the number,
+Some of these compiles do not finish within any usable load time. A translated
+compute pipeline, large ones such as device slots 62 and 86 included, therefore
+waits only
+`TUXBOX_PIPELINE_DEADLINE` seconds (default 2). After that the game gets a
+stand-in with the same root signature and the compile continues in the
+background. A command list that binds the pipeline waits there for the compiled
+result, so no work is dropped. At most `TUXBOX_PIPELINE_MAX_QUEUED` compiles
+(default 64) wait for a background slot, because each one holds a copy of its
+shader; past that, creation waits for room. `TUXBOX_PIPELINE_DEADLINE=0` waits
+instead. `TUXBOX_LARGE_COMPILES` sets the number,
 and `0` removes the limit. The first launch can still spend a long time loading.
 
 ### GPU waits and sample masks

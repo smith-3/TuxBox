@@ -54,8 +54,8 @@ pub(super) unsafe extern "system" fn clear_state(list: &List, pipeline: *mut c_v
     // Desktop ClearState takes no pipeline. The guest argument is bound after
     // the reset so a following draw sees that pipeline.
     unsafe { state.native().ClearState(None::<&ID3D12PipelineState>) };
-    if let Some(pipeline) = pipeline {
-        unsafe { state.native().SetPipelineState(&pipeline.native) };
+    if let Some(native) = state.bindings.pipeline.as_ref().and_then(super::compute_bindings::Pipeline::native).cloned() {
+        unsafe { state.native().SetPipelineState(&native) };
     }
 }
 

@@ -46,7 +46,10 @@ The launcher sets these for a Proton or Wine launch. A value you set yourself is
 | `TUXBOX_SHADER_PREP_UI` | on for ProjectScarlett | `1` shows a desktop progress window |
 | `TUXBOX_SCARLETT_SEED_PACK` | off | `1` prepares every shader in `shaders.rpf` |
 | `TUXBOX_LARGE_COMPILES` | `4` | Large compute pipelines compiling at once; `0` removes the limit |
-| `TUXBOX_PIPELINE_DEADLINE` | `20` | Seconds before a large compile gets an empty stand-in; `0` waits |
+| `TUXBOX_PIPELINE_DEADLINE` | `2` | Seconds pipeline creation waits for the driver before the compile continues in the background; `0` waits |
+| `TUXBOX_PIPELINE_MAX_LIVE` | one per CPU core, 2 to 16 | Background pipeline compiles at once, 1 to 16 |
+| `TUXBOX_PIPELINE_MAX_QUEUED` | `64` | Background compiles waiting for a slot, 1 to 4096; past it pipeline creation waits |
+| `TUXBOX_MESH_COMPILES` | off | Native mesh pipelines created at once |
 | `TUXBOX_NULL_PIPELINES` | on | `0` fails unsupported pipelines instead of giving empty stand-ins |
 | `TUXBOX_PROGRESS_OVERLAY` | `auto` | `always` or `0` for the progress panel |
 | `TUXBOX_PROGRESS_OVERLAY_POS` | `tr` | `tl`, `tr`, `bl` or `br` |

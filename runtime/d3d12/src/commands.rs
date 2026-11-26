@@ -254,11 +254,12 @@ unsafe extern "system" fn reset(
         return E_FAIL;
     }
     let native = &list.native;
+    let initial_native = initial.map(device::compute::Pipeline::bound_native);
     let hr = unsafe {
         (native.vtable().Reset)(
             native.as_raw(),
             allocator.native.as_raw(),
-            initial.map_or(ptr::null_mut(), |p| p.native.as_raw()),
+            initial_native.as_ref().map_or(ptr::null_mut(), Interface::as_raw),
         )
     };
     if hr.is_ok() {
@@ -773,6 +774,9 @@ pub(crate) unsafe fn wrap_command_list(
         return windows::Win32::Foundation::E_NOINTERFACE;
     }
     let list_type = unsafe { native.GetType() };
+    let bindings = compute_bindings::Bindings::new(initial);
+    // Reopening a fresh list must bind the resolved pipeline, not the proxy's stand-in.
+    let initial_native = bindings.pipeline.as_ref().and_then(compute_bindings::Pipeline::native).cloned();
     let state = ListData {
         reserved0: [0; 2],
         write_cursor: 0,
@@ -791,7 +795,7 @@ pub(crate) unsafe fn wrap_command_list(
             timestamp_page: None,
             resources: allocator.state.clone(),
             scene_commands: Vec::new(),
-            bindings: compute_bindings::Bindings::new(initial),
+            bindings,
             predication: None,
             graphics_state: recording::GraphicsState::default(),
             active_queries: 0,
@@ -813,7 +817,7 @@ pub(crate) unsafe fn wrap_command_list(
             scalar_descriptors: Default::default(),
             sampled_heaps: Vec::new(),
             media: compact.then(|| media::Recording::new(allocator)),
-            phase: ListState::Fresh(allocator.native.clone(), initial.map(|p| p.native.clone())),
+            phase: ListState::Fresh(allocator.native.clone(), initial_native),
             error: S_OK,
             error_reported: false,
         }),

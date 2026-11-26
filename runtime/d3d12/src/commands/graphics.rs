@@ -43,11 +43,14 @@ pub(super) unsafe extern "system" fn pipeline(list: &List, guest: *mut c_void) {
     }
     match unsafe { crate::device::compute::pipeline(guest, parent(&list.parent)) } {
         Ok(Some(host)) => {
+            let bound = super::compute_bindings::Pipeline::from(host);
+            if let Some(native) = bound.native() {
+                unsafe { state.native().SetPipelineState(native) };
+            }
             state.stencil_slot = host.state.stencil_slot;
-            state.bindings.null_usage = host.state.null_usage.clone();
-            state.bindings.pipeline = Some(host.into());
+            state.bindings.null_usage = host.fallback_tag();
+            state.bindings.pipeline = Some(bound);
             state.bindings.draw_trace = host.state.draw_trace.clone();
-            unsafe { state.native().SetPipelineState(&host.native) };
         }
         _ => state.error = E_INVALIDARG,
     }

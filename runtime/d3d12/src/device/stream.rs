@@ -503,7 +503,8 @@ unsafe fn create(
     let label = stream_label(&original);
     // A large translated compute program can compile for longer than any load
     // will wait. It runs on a detached, queued compile with a deadline; past
-    // that the title gets the stand-in, as on the direct compute path.
+    // that the title gets a stand-in until a command list first binds it, as on
+    // the direct compute path.
     let compute_code = original[5]
         .and_then(|(_, translated)| translated.map(|index| &stages[index]))
         .filter(|code| crate::compile_gate::is_large(code.len()));
@@ -526,17 +527,25 @@ unsafe fn create(
             D3D12_PIPELINE_STATE_FLAG_NONE,
         ) {
             crate::big_stack::PipelineWait::Ready(result) => result,
-            crate::big_stack::PipelineWait::Deferred => {
+            crate::big_stack::PipelineWait::Deferred(pending) => {
                 let hashes = original.map(|stage| {
                     stage.and_then(|(code, prepared)| {
                         shader_cache::source_digest(code).map(|hash| (hash, prepared.is_some()))
                     })
                 });
                 // SAFETY: the stream storage and its field pointers are still live.
-                return unsafe {
+                return match unsafe {
                     null_pipeline(host, &native_desc, &fields, stream_output, geometry_record, pipeline, &hashes)
-                }
-                .unwrap_or_else(|| Err(E_NOTIMPL.into()));
+                } {
+                    Some(Ok(stand_in)) => {
+                        // Command lists bind the compiled pipeline, so this is no null use.
+                        pipeline.null_usage = None;
+                        pipeline.pending = Some(pending);
+                        Ok(stand_in)
+                    }
+                    // Without a stand-in the title waits now, as it did before deferral.
+                    _ => pending.wait().unwrap_or_else(|| Err(E_NOTIMPL.into())),
+                };
             }
         }
     } else if fields[7].is_some() {

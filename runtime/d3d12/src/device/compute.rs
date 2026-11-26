@@ -30,6 +30,36 @@ pub(crate) struct PipelineData {
     /// The guest root with the literal samplers the program needs and the root
     /// leaves out; set around each dispatch (see `compute_table::sampler_root`).
     pub(crate) sampler_root: Option<ID3D12RootSignature>,
+    /// A driver compile that outlived creation. Until it finishes, the proxy
+    /// holds a resource-free stand-in with the same root signature.
+    pub(crate) pending: Option<crate::big_stack::Pending<windows::core::Result<ID3D12PipelineState>>>,
+}
+
+impl Pipeline {
+    /// The native pipeline a command list binds. A compile that outlived
+    /// creation is waited for here, when the title first uses the pipeline.
+    /// A compile that failed leaves the stand-in, as a failed create does.
+    pub(crate) fn bound_native(&self) -> ID3D12PipelineState {
+        match self.state.pending.as_ref().and_then(crate::big_stack::Pending::wait) {
+            Some(Ok(native)) => native,
+            _ => self.native.clone(),
+        }
+    }
+
+    pub(crate) fn fallback_tag(&self) -> Option<std::sync::Arc<crate::diagnostics::null_usage::Tag>> {
+        if let Some(tag) = &self.state.null_usage {
+            return Some(tag.clone());
+        }
+        if !crate::commands::queue_trace::enabled() {
+            return None;
+        }
+        self.state.pending.as_ref()?.inspect_completed(|id, label, result| {
+            result.as_ref().err().map(|error| std::sync::Arc::new(crate::diagnostics::null_usage::Tag {
+                kind: "compute",
+                stages: format!("{label} job={id} hr={:#010x}", error.code().0),
+            }))
+        }).flatten()
+    }
 }
 
 const _: () = assert!(
@@ -285,8 +315,7 @@ unsafe fn create_pipeline_x_inner(
     };
     let compute_threads = guest_threads
         .or_else(|| translation.as_deref().and_then(tuxbox_dxbc::shader_compute_threads));
-    // The group size above is the console's. A narrow-wave translation runs the
-    // same group on half as many host threads, so it is chosen only now.
+    // The reported dimensions are the guest's, before a paired-wave translation.
     let translation = translation.map(|code| fitting_translation(this, code));
     let code = translation.as_deref().unwrap_or(bytes);
     if let Some(refusal) = unsupported_wave_size(this, code) {
@@ -312,86 +341,61 @@ unsafe fn create_pipeline_x_inner(
     let label = super::shader_cache::source_digest(bytes)
         .map(|hash| format!("CS {}", &hash[..8]))
         .unwrap_or_else(|| "CS".to_string());
-    let mut host = D3D12_COMPUTE_PIPELINE_STATE_DESC {
-        pRootSignature: ManuallyDrop::new(
-            scene_root
-                .as_ref()
-                .map(|s| &s.native)
-                .or_else(|| reflected.as_ref().map(|t| &t.native))
-                .or(sampler_root.as_ref())
-                .or(root.map(|p| &p.native))
-                .cloned(),
-        ),
-        CS: D3D12_SHADER_BYTECODE {
-            pShaderBytecode: code.as_ptr().cast(),
-            BytecodeLength: code.len(),
-        },
-        NodeMask: desc.NodeMask,
-        Flags: desc.Flags,
-        ..Default::default()
-    };
     // The driver compile must own its device, root signature, and shader bytes:
     // a deadline can return while that compile is still writing the GPU cache.
-    let signature = core::mem::ManuallyDrop::into_inner(host.pRootSignature.clone());
-    let compile = |shader: &[u8]| {
-        let device = this.native.clone();
-        let signature = signature.clone();
-        let shader = shader.to_vec();
-        let node_mask = desc.NodeMask;
-        let flags = desc.Flags;
-        let name = label.clone();
-        crate::big_stack::run_deadline(&label, move || {
-            // Large programs queue here so the driver does not compile them
-            // all at once. The queue is on the detached compile thread, so the
-            // title's own thread still returns at the deadline.
-            let _slot = crate::compile_gate::large_compile(shader.len(), |slots| {
-                crate::diagnostics::log(&format!("{name} waits for one of {slots} large compile slots"));
-            });
-            owned_compile(device, signature, shader, node_mask, flags)
-        })
-    };
-    // Boot 174727 substituted null pipelines for translated shaders whose
-    // driver compile passed 20s. Those null pipelines have no paged layout, so
-    // the dispatch that precedes the account-picker draws was dropped.
-    // Large translated programs are the exception: the driver can take longer
-    // than any load will wait, so they get the deadline and a stand-in too.
-    let mut native = if translation.is_some() && !crate::compile_gate::is_large(code.len()) {
-        static WAIT: std::sync::Once = std::sync::Once::new();
-        crate::diagnostics::log_once(&WAIT, || {
-            "translated compute pipelines wait for the driver compile".to_string()
-        });
+    let signature = scene_root
+        .as_ref()
+        .map(|s| &s.native)
+        .or_else(|| reflected.as_ref().map(|t| &t.native))
+        .or(sampler_root.as_ref())
+        .or(root.map(|p| &p.native))
+        .cloned();
+    // Structural checks cannot validate DXIL instructions or root bindings, so
+    // the adapter gets the original guest shader if it rejects the translation.
+    let retry = (translation.is_some() && reflected.is_none() && scene_root.is_none()).then(|| bytes.to_vec());
+    let trace_source = crate::commands::queue_trace::enabled().then(|| compute_source_kind(bytes));
+    let attempt = if translation.is_some() { "translated" } else { "original" };
+    let compile = {
         let device = this.native.clone();
         let signature = signature.clone();
         let shader = code.to_vec();
         let node_mask = desc.NodeMask;
         let flags = desc.Flags;
-        crate::big_stack::run_logged(&label, move || {
-            owned_compile(device, signature, shader, node_mask, flags)
-        })
-    } else {
-        match compile(code) {
-            crate::big_stack::PipelineWait::Ready(result) => result,
-            crate::big_stack::PipelineWait::Deferred => {
-                // The original guest shader would be a second long driver compile.
-                crate::failures::refusal("CS", "driver compile deadline");
-                unsafe { ManuallyDrop::drop(&mut host.pRootSignature) };
-                return unsafe { null_compute(this, root.map(|p| &p.native), desc, compute_threads, out) }.unwrap_or(E_NOTIMPL);
+        let name = label.clone();
+        move || {
+            // Large programs queue here so the driver does not compile them
+            // all at once. The queue is on the compile thread, so the title's
+            // own thread still returns at the deadline.
+            let _slot = crate::compile_gate::large_compile(shader.len(), |slots| {
+                crate::diagnostics::log(&format!("{name} waits for one of {slots} large compile slots"));
+            });
+            let result = owned_compile(device.clone(), signature.clone(), shader, node_mask, flags);
+            if let Some(source) = trace_source {
+                trace_compile_failure(&name, attempt, source, &result);
             }
+            if let (Err(_), Some(original)) = (&result, retry) {
+                let result = owned_compile(device, signature, original, node_mask, flags);
+                if let Some(source) = trace_source {
+                    trace_compile_failure(&name, "original-retry", source, &result);
+                }
+                return result;
+            }
+            result
         }
     };
-    if translation.is_some() && reflected.is_none() && scene_root.is_none() && native.is_err() {
-        // Structural checks cannot validate DXIL instructions or root bindings.
-        // Let the adapter handle the original guest shader if it rejects the cache.
-        native = match compile(bytes) {
-            crate::big_stack::PipelineWait::Ready(result) => result,
-            crate::big_stack::PipelineWait::Deferred => {
-                crate::failures::refusal("CS", "driver compile deadline");
-                unsafe { ManuallyDrop::drop(&mut host.pRootSignature) };
-                return unsafe { null_compute(this, root.map(|p| &p.native), desc, compute_threads, out) }.unwrap_or(E_NOTIMPL);
-            }
-        };
-    }
-    unsafe { ManuallyDrop::drop(&mut host.pRootSignature) };
+    // Boot 174727 substituted null pipelines for translated shaders whose
+    // driver compile passed 20s. Those null pipelines have no paged layout, so
+    // the dispatch that precedes the account-picker draws was dropped. A
+    // pipeline still compiling now keeps its layout and a stand-in, and command
+    // lists wait for the compiled pipeline when they first bind it.
+    let (native, pending) = match crate::big_stack::run_deadline(&label, compile) {
+        crate::big_stack::PipelineWait::Ready(result) => (result, None),
+        crate::big_stack::PipelineWait::Deferred(pending) => match null_native(this, signature.as_ref(), desc) {
+            Some(stand_in) => (Ok(stand_in), Some(pending)),
+            // Without a stand-in the title waits now, as it did before deferral.
+            None => (pending.wait().unwrap_or_else(|| Err(E_NOTIMPL.into())), None),
+        },
+    };
     if let Err(error) = &native {
         if let Some(root) = root { super::compute_table::capture_stage_root(bytes, &root.state); }
         crate::diagnostics::compute_failure(bytes, error.code().0);
@@ -415,6 +419,7 @@ unsafe fn create_pipeline_x_inner(
                 reflected,
                 compute_threads,
                 sampler_root,
+                pending,
                 ..Default::default()
             },
             out,
@@ -440,8 +445,37 @@ pub(super) fn large_deferred(
         let _slot = crate::compile_gate::large_compile(shader.len(), |slots| {
             crate::diagnostics::log(&format!("{name} waits for one of {slots} large compile slots"));
         });
-        owned_compile(device, root, shader, node_mask, flags)
+        let result = owned_compile(device, root, shader, node_mask, flags);
+        if crate::commands::queue_trace::enabled() {
+            trace_compile_failure(&name, "translated-stream", "-", &result);
+        }
+        result
     })
+}
+
+fn compute_source_kind(bytes: &[u8]) -> &'static str {
+    let Ok(container) = tuxbox_dxbc::Dxbc::parse(bytes) else { return "unknown" };
+    if let Some(part) = container.chunk(b"DXIL") {
+        let body = &bytes[part.offset..part.offset + part.size];
+        if body.get(24..28) == Some(b"XDAT") { "XDAT" } else { "DXIL" }
+    } else if container.chunk(b"ACCC").is_some() {
+        "ACCC"
+    } else {
+        "unknown"
+    }
+}
+
+fn trace_compile_failure(
+    label: &str,
+    attempt: &str,
+    source: &str,
+    result: &windows::core::Result<ID3D12PipelineState>,
+) {
+    if let Err(error) = result {
+        crate::diagnostics::log(&format!(
+            "queue trace compile failed {label} hr={:#010x} attempt={attempt} source={source}", error.code().0
+        ));
+    }
 }
 
 /// The guest descriptor can be released as soon as the caller returns. A
@@ -471,12 +505,9 @@ fn owned_compile(
     result
 }
 
-/// Create a resource-free compute pipeline on the guest root (see `fallback`).
-unsafe fn null_compute(
-    this: &Device, root: Option<&ID3D12RootSignature>, desc: &D3D12_COMPUTE_PIPELINE_STATE_DESC,
-    compute_threads: Option<[u32; 3]>, out: Out,
-) -> Option<HRESULT> {
-    use super::fallback::{Stage, bytecode, enabled, shader, substituted};
+/// A resource-free compute pipeline on `root` (see `fallback`).
+fn null_native(this: &Device, root: Option<&ID3D12RootSignature>, desc: &D3D12_COMPUTE_PIPELINE_STATE_DESC) -> Option<ID3D12PipelineState> {
+    use super::fallback::{Stage, bytecode, enabled, shader};
     if !enabled() { return None; }
     let mut host = D3D12_COMPUTE_PIPELINE_STATE_DESC {
         pRootSignature: ManuallyDrop::new(root.cloned()),
@@ -487,8 +518,17 @@ unsafe fn null_compute(
     };
     let native = crate::big_stack::run_logged("null CS", || unsafe { this.native.CreateComputePipelineState::<ID3D12PipelineState>(&host) });
     unsafe { ManuallyDrop::drop(&mut host.pRootSignature) };
-    if native.is_err() { return None; }
-    let null_usage = crate::diagnostics::display::enabled().then(|| {
+    native.ok()
+}
+
+/// Create a resource-free compute pipeline on the guest root (see `fallback`).
+unsafe fn null_compute(
+    this: &Device, root: Option<&ID3D12RootSignature>, desc: &D3D12_COMPUTE_PIPELINE_STATE_DESC,
+    compute_threads: Option<[u32; 3]>, out: Out,
+) -> Option<HRESULT> {
+    use super::fallback::substituted;
+    let native = Ok(null_native(this, root, desc)?);
+    let null_usage = (crate::diagnostics::display::enabled() || crate::commands::queue_trace::enabled()).then(|| {
         let digest = if !desc.CS.pShaderBytecode.is_null() && desc.CS.BytecodeLength <= 64 * 1024 * 1024 {
             let code = unsafe { std::slice::from_raw_parts(desc.CS.pShaderBytecode.cast::<u8>(), desc.CS.BytecodeLength) };
             super::shader_cache::source_digest(code)
@@ -533,27 +573,33 @@ pub(super) fn check_wave_range(required: (u32, u32), host: (u32, u32)) -> Option
     Some(WaveRefusal { detail, tag })
 }
 
-/// `translation`, or the narrow-wave translation of the same program when this
-/// host cannot run it and the compiler can produce one.
-pub(super) fn fitting_translation(device: &Device, translation: Vec<u8>) -> Vec<u8> {
-    let Some(host) = super::host_profile::wave_range(device) else { return translation };
-    if !needs_narrow_waves(super::shader_cache::portable_wave_range(&translation), host) {
-        return translation;
-    }
-    super::shader_cache::narrow_wave_variant(&translation).unwrap_or(translation)
-}
-
-/// Whether a program that needs exactly 64 lanes meets a host that has fewer.
-pub(super) fn needs_narrow_waves(required: Option<(u32, u32)>, (_, host_max): (u32, u32)) -> bool {
-    required == Some((64, 64)) && host_max == 32
-}
-
 /// Returns a refusal if `shader` is portable DXIL whose required wave size is
 /// unsupported by `device`'s `D3D12_FEATURE_D3D12_OPTIONS1` wave lane range.
 pub(super) fn unsupported_wave_size(device: &Device, shader: &[u8]) -> Option<WaveRefusal> {
     let required = super::shader_cache::portable_wave_range(shader)?;
     let host = super::host_profile::wave_range(device)?;
     check_wave_range(required, host)
+}
+
+/// Choose a paired-wave variant when the host cannot run the requested wave size.
+pub(super) fn fitting_translation(device: &Device, translation: Vec<u8>) -> Vec<u8> {
+    let Some(host) = super::host_profile::wave_range(device) else { return translation };
+    if !needs_narrow_waves(super::shader_cache::portable_wave_range(&translation), host) {
+        return translation;
+    }
+    static DISABLED: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        std::env::var_os("TUXBOX_DISABLE_PAIRED_WAVE64").as_deref() == Some(std::ffi::OsStr::new("1"))
+    });
+    if *DISABLED {
+        static REPORT: std::sync::Once = std::sync::Once::new();
+        crate::diagnostics::log_once(&REPORT, || "paired Wave64 translation disabled for this run".into());
+        return translation;
+    }
+    super::shader_cache::narrow_wave_variant(&translation).unwrap_or(translation)
+}
+
+pub(super) fn needs_narrow_waves(required: Option<(u32, u32)>, (_, host_max): (u32, u32)) -> bool {
+    required == Some((64, 64)) && host_max == 32
 }
 
 #[cfg(test)]

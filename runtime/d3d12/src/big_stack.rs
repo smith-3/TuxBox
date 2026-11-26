@@ -7,11 +7,13 @@
 //! inside the compiler and died (ProjectScarlett stayed on a black screen).
 //!
 //! A cold NVIDIA disk cache then spends minutes inside that same call, turning
-//! DXIL into a GPU binary. An untranslated compute shader waits a bounded time
-//! and, if the driver is still compiling, returns so the title can substitute
-//! a null pipeline. A translated shader waits for the real pipeline: a null
-//! stand-in has no descriptor-heap layout, and the title's dispatch is then
-//! dropped. The compile keeps the device, root signature, and shader bytes.
+//! DXIL into a GPU binary. Titles create their pipelines up front: ProjectScarlett
+//! creates about 59,000 before its first frame, on job threads its main thread
+//! waits for, so a call that blocks on the driver holds the whole boot. A compile
+//! that outlives the deadline therefore continues on a helper thread, and the
+//! title gets its pipeline object at once. [`Pending::wait`] delivers the
+//! compiled pipeline when a command list first binds it. The compile keeps the
+//! device, root signature, and shader bytes.
 
 /// Reserved, not committed: untouched pages cost only address space.
 const STACK_BYTES: usize = 64 << 20;
@@ -62,12 +64,128 @@ pub(crate) fn run_logged<R, F: FnOnce() -> R>(label: &str, job: F) -> R {
 /// The compile finished, or it is still running after the deadline.
 pub(crate) enum PipelineWait<T> {
     Ready(T),
-    /// The title can substitute a null pipeline. The driver compile continues
-    /// on a helper thread and still records its GPU binary.
-    Deferred,
+    /// The driver compile continues on a helper thread, or waits in the queue
+    /// for one. [`Pending::wait`] returns its result.
+    Deferred(Pending<T>),
 }
 
-/// Wait up to `TUXBOX_PIPELINE_DEADLINE` seconds (default 20). `0` waits until
+/// The result of a compile that outlived its deadline.
+pub(crate) struct Pending<R> {
+    cell: std::sync::Arc<Cell<R>>,
+}
+
+struct Cell<R> {
+    /// Finds this compile in the queue if no helper has started it yet.
+    id: u64,
+    label: String,
+    state: std::sync::Mutex<Outcome<R>>,
+    settled: std::sync::Condvar,
+}
+
+enum Outcome<R> {
+    Compiling,
+    Done(R),
+    /// The compile ended without a result, which only a panic can do.
+    Lost,
+}
+
+impl<R> Cell<R> {
+    fn settle(&self, outcome: Outcome<R>) {
+        *self.state.lock().unwrap_or_else(|error| error.into_inner()) = outcome;
+        self.settled.notify_all();
+    }
+
+    /// The finished result, or `None` once `timeout` passes first.
+    fn take_within(&self, timeout: std::time::Duration) -> Option<Result<R, ()>> {
+        let state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        let (mut state, _) = self
+            .settled
+            .wait_timeout_while(state, timeout, |state| matches!(state, Outcome::Compiling))
+            .unwrap_or_else(|error| error.into_inner());
+        match std::mem::replace(&mut *state, Outcome::Lost) {
+            Outcome::Compiling => {
+                *state = Outcome::Compiling;
+                None
+            }
+            Outcome::Done(value) => Some(Ok(value)),
+            Outcome::Lost => Some(Err(())),
+        }
+    }
+}
+
+/// Settles the cell even if the compile unwinds, so no waiter blocks forever.
+struct Delivery<R> {
+    cell: std::sync::Arc<Cell<R>>,
+    finished: bool,
+}
+
+impl<R> Delivery<R> {
+    fn finish(mut self, value: R) {
+        self.cell.settle(Outcome::Done(value));
+        self.finished = true;
+    }
+}
+
+impl<R> Drop for Delivery<R> {
+    fn drop(&mut self) {
+        if !self.finished {
+            self.cell.settle(Outcome::Lost);
+        }
+    }
+}
+
+impl<R: Clone> Pending<R> {
+    /// Block until the compile finishes, giving its queued job priority.
+    pub(crate) fn wait(&self) -> Option<R> {
+        if let Some(outcome) = self.finished() {
+            return outcome;
+        }
+        let started = std::time::Instant::now();
+        if trace_waits() {
+            crate::diagnostics::log(&format!(
+                "pipeline wait begin id={} {}", self.cell.id, self.cell.label
+            ));
+        }
+        prioritize(self.cell.id);
+        on_slot_released();
+        let state = self.cell.state.lock().unwrap_or_else(|error| error.into_inner());
+        let state = self
+            .cell
+            .settled
+            .wait_while(state, |state| matches!(state, Outcome::Compiling))
+            .unwrap_or_else(|error| error.into_inner());
+        let outcome = match &*state {
+            Outcome::Done(value) => Some(value.clone()),
+            _ => None,
+        };
+        drop(state);
+        if trace_waits() {
+            crate::diagnostics::log(&format!(
+                "pipeline wait end id={} {} elapsed_ms={} ready={}",
+                self.cell.id, self.cell.label, started.elapsed().as_millis(), outcome.is_some()
+            ));
+        }
+        note_first_use(&self.cell.label, started.elapsed());
+        outcome
+    }
+
+    fn finished(&self) -> Option<Option<R>> {
+        match &*self.cell.state.lock().unwrap_or_else(|error| error.into_inner()) {
+            Outcome::Compiling => None,
+            Outcome::Done(value) => Some(Some(value.clone())),
+            Outcome::Lost => Some(None),
+        }
+    }
+
+    pub(crate) fn inspect_completed<T>(&self, inspect: impl FnOnce(u64, &str, &R) -> T) -> Option<T> {
+        match &*self.cell.state.lock().unwrap_or_else(|error| error.into_inner()) {
+            Outcome::Done(result) => Some(inspect(self.cell.id, &self.cell.label, result)),
+            _ => None,
+        }
+    }
+}
+
+/// Wait up to `TUXBOX_PIPELINE_DEADLINE` seconds (default 2). `0` waits until
 /// the driver returns. Past the deadline the helper is detached, not cancelled.
 pub(crate) fn run_deadline<R, F>(label: &str, job: F) -> PipelineWait<R>
 where
@@ -78,12 +196,12 @@ where
     static ANNOUNCED: std::sync::Once = std::sync::Once::new();
     if deadline.is_zero() {
         crate::diagnostics::log_once(&ANNOUNCED, || {
-            "compute pipelines wait for the driver compile".to_string()
+            "pipelines wait for the driver compile".to_string()
         });
     } else {
         crate::diagnostics::log_once(&ANNOUNCED, || {
             format!(
-                "compute pipelines wait {}s, then return a null pipeline while the driver compile continues ({} at a time)",
+                "pipelines wait {}s for the driver, then finish compiling while the title continues ({} at a time); command lists wait for them on first use",
                 deadline.as_secs(),
                 max_live()
             )
@@ -92,18 +210,32 @@ where
     run_for(label, deadline, job)
 }
 
+fn note_first_use(label: &str, waited: std::time::Duration) {
+    if waited >= std::time::Duration::from_millis(100) {
+        crate::diagnostics::log(&format!(
+            "first use of {label} waited {}ms for its compile",
+            waited.as_millis()
+        ));
+    }
+}
+
+fn trace_waits() -> bool {
+    static TRACE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *TRACE.get_or_init(|| std::env::var_os("TUXBOX_TRACE_PIPELINE_WAITS").as_deref() == Some(std::ffi::OsStr::new("1")))
+}
+
 fn pipeline_deadline() -> std::time::Duration {
     static DEADLINE: std::sync::OnceLock<std::time::Duration> = std::sync::OnceLock::new();
     *DEADLINE.get_or_init(|| parse_deadline(std::env::var("TUXBOX_PIPELINE_DEADLINE").ok().as_deref()))
 }
 
+/// The default only bounds how long creation blocks. A pipeline still compiling
+/// is waited for when it is first bound, so no title work is dropped.
 fn parse_deadline(text: Option<&str>) -> std::time::Duration {
+    const DEFAULT: std::time::Duration = std::time::Duration::from_secs(2);
     match text {
-        None => std::time::Duration::from_secs(20),
-        Some(text) => match text.parse::<u64>() {
-            Ok(seconds) => std::time::Duration::from_secs(seconds),
-            Err(_) => std::time::Duration::from_secs(20),
-        },
+        None => DEFAULT,
+        Some(text) => text.parse::<u64>().map_or(DEFAULT, std::time::Duration::from_secs),
     }
 }
 
@@ -115,11 +247,20 @@ fn max_live() -> usize {
     // Each live compile reserves a 64 MiB stack and occupies a driver thread.
     // One per CPU, capped, so a title that keeps submitting cannot pile up
     // hundreds of detached compiles.
-    let chosen = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(8).clamp(2, 16);
+    let cpus = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(8);
+    let configured = std::env::var("TUXBOX_PIPELINE_MAX_LIVE").ok();
+    let chosen = compile_limit(configured.as_deref(), cpus);
     match MAX_LIVE.compare_exchange(0, chosen, std::sync::atomic::Ordering::AcqRel, std::sync::atomic::Ordering::Acquire) {
         Ok(_) => chosen,
         Err(existing) => existing,
     }
+}
+
+fn compile_limit(configured: Option<&str>, cpus: usize) -> usize {
+    configured
+        .and_then(|text| text.parse().ok())
+        .filter(|value| (1..=16).contains(value))
+        .unwrap_or_else(|| cpus.clamp(2, 16))
 }
 
 fn run_for<R, F>(label: &str, deadline: std::time::Duration, job: F) -> PipelineWait<R>
@@ -130,61 +271,74 @@ where
     if deadline.is_zero() {
         return PipelineWait::Ready(run_logged(label, job));
     }
+    static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    let cell = std::sync::Arc::new(Cell {
+        id: NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+        label: label.to_string(),
+        state: std::sync::Mutex::new(Outcome::Compiling),
+        settled: std::sync::Condvar::new(),
+    });
+    let delivery = Delivery { cell: std::sync::Arc::clone(&cell), finished: false };
+    let deliver = move || {
+        if trace_waits() {
+            crate::diagnostics::log(&format!(
+                "pipeline job begin id={} {}", delivery.cell.id, delivery.cell.label
+            ));
+        }
+        let value = job();
+        if trace_waits() {
+            crate::diagnostics::log(&format!(
+                "pipeline job end id={} {}", delivery.cell.id, delivery.cell.label
+            ));
+        }
+        delivery.finish(value);
+    };
     if !reserve_slot() {
-        enqueue(label, job);
+        enqueue(label, cell.id, deliver);
         // A slot may have freed between the reservation attempt and the push.
         on_slot_released();
         note_deferred(label, None);
-        return PipelineWait::Deferred;
+        return PipelineWait::Deferred(Pending { cell });
     }
     // The calling title thread waits here, up to the deadline.
     let _pause = crate::title_watchdog::pause();
-    let (tx, rx) = std::sync::mpsc::channel();
-    let shared = std::sync::Arc::new(std::sync::Mutex::new(Some(job)));
+    let shared = std::sync::Arc::new(std::sync::Mutex::new(Some(deliver)));
     let for_thread = std::sync::Arc::clone(&shared);
     let label_owned = label.to_string();
-    // Owned by the closure so a failed spawn releases the reservation.
-    let slot = Slot;
     let spawned = spawn_pipeline(move || {
-        let _slot = slot;
+        let _slot = Slot;
         let _watch = PipelineWatch::start(&label_owned);
-        let job = take_job(&for_thread);
-        let value = job();
-        // The caller may already have dropped the receiver. That is the deadline.
-        let _ = tx.send(value);
+        take_job(&for_thread)();
     });
     let handle = match spawned {
         Ok(handle) => handle,
-        Err(_) => return PipelineWait::Ready(run_logged(label, take_job(&shared))),
+        Err(_) => {
+            let _slot = Slot;
+            run_logged(label, take_job(&shared));
+            return match cell.take_within(std::time::Duration::ZERO) {
+                Some(Ok(value)) => PipelineWait::Ready(value),
+                _ => panic!("pipeline compile ended without a result"),
+            };
+        }
     };
-    match rx.recv_timeout(deadline) {
-        Ok(value) => {
+    match cell.take_within(deadline) {
+        Some(Ok(value)) => {
             join_or_resume(handle);
             PipelineWait::Ready(value)
         }
-        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => match rx.try_recv() {
-            Ok(value) => {
-                join_or_resume(handle);
-                PipelineWait::Ready(value)
-            }
-            Err(std::sync::mpsc::TryRecvError::Empty) => {
-                drop(rx);
-                note_deferred(label, Some(deadline));
-                // Detach. The helper keeps running until the driver returns.
-                drop(handle);
-                PipelineWait::Deferred
-            }
-            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                join_or_resume(handle);
-                panic!("pipeline compile ended without a result");
-            }
-        },
-        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+        Some(Err(())) => {
             join_or_resume(handle);
             panic!("pipeline compile ended without a result");
         }
+        None => {
+            note_deferred(label, Some(deadline));
+            // Detach. The helper keeps running until the driver returns.
+            drop(handle);
+            PipelineWait::Deferred(Pending { cell })
+        }
     }
 }
+
 
 fn note_deferred(label: &str, waited: Option<std::time::Duration>) {
     match waited {
@@ -196,18 +350,72 @@ fn note_deferred(label: &str, waited: Option<std::time::Duration>) {
     }
 }
 
-fn enqueue<R, F>(label: &str, job: F)
+/// Each queued compile owns copies of its shader bytes and root signature, and
+/// a title creates tens of thousands of pipelines faster than the driver
+/// compiles them. Past `max_queued` the creating thread waits for a queued
+/// compile to start, so memory stays bounded and `max_live` still caps the
+/// driver's concurrent compiles.
+fn enqueue<F>(label: &str, id: u64, job: F)
 where
-    R: Send + 'static,
-    F: FnOnce() -> R + Send + 'static,
+    F: FnOnce() + Send + 'static,
 {
-    let label = label.to_string();
-    queue().push_back(Queued {
-        label,
-        job: Box::new(move || {
-            let _ = job();
-        }),
-    });
+    let mut job = Some(Queued { label: label.to_string(), id, job: Box::new(job) });
+    let mut _pause = None;
+    loop {
+        {
+            let mut queued = queue();
+            if queued.len() < max_queued() {
+                queued.push_back(job.take().expect("queued once"));
+                return;
+            }
+            if _pause.is_none() {
+                static FULL: std::sync::Once = std::sync::Once::new();
+                crate::diagnostics::log_once(&FULL, || {
+                    format!("pipeline compile queue holds {} compiles; creation waits for room", queued.len())
+                });
+                _pause = Some(crate::title_watchdog::pause());
+            }
+            // Bounded, so a slot released without a pump still gets one below.
+            drop(QUEUE_ROOM.wait_timeout(queued, std::time::Duration::from_millis(100)));
+        }
+        on_slot_released();
+    }
+}
+
+/// Signalled whenever a compile leaves the queue.
+static QUEUE_ROOM: std::sync::Condvar = std::sync::Condvar::new();
+
+static MAX_QUEUED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+fn max_queued() -> usize {
+    let current = MAX_QUEUED.load(std::sync::atomic::Ordering::Relaxed);
+    if current != 0 {
+        return current;
+    }
+    let configured = std::env::var("TUXBOX_PIPELINE_MAX_QUEUED").ok();
+    let chosen = queue_limit(configured.as_deref());
+    match MAX_QUEUED.compare_exchange(0, chosen, std::sync::atomic::Ordering::AcqRel, std::sync::atomic::Ordering::Acquire) {
+        Ok(_) => chosen,
+        Err(existing) => existing,
+    }
+}
+
+fn queue_limit(configured: Option<&str>) -> usize {
+    const DEFAULT: usize = 64;
+    configured
+        .and_then(|text| text.trim().parse().ok())
+        .filter(|value| (1..=4096).contains(value))
+        .unwrap_or(DEFAULT)
+}
+
+/// Give a pipeline needed by a command list the next available compile slot.
+fn prioritize(id: u64) {
+    let mut queue = queue();
+    if let Some(index) = queue.iter().position(|queued| queued.id == id)
+        && let Some(job) = queue.remove(index)
+    {
+        queue.push_front(job);
+    }
 }
 
 fn spawn_pipeline<F>(job: F) -> std::io::Result<std::thread::JoinHandle<()>>
@@ -232,6 +440,7 @@ fn join_or_resume(handle: std::thread::JoinHandle<()>) {
 
 struct Queued {
     label: String,
+    id: u64,
     job: Box<dyn FnOnce() + Send>,
 }
 
@@ -280,51 +489,48 @@ impl Drop for Slot {
     }
 }
 
-/// Stops a failed `spawn` from recursively trying to spawn again.
-static PUMP: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static PUMP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 fn on_slot_released() {
-    if PUMP.fetch_add(1, std::sync::atomic::Ordering::AcqRel) != 0 {
-        PUMP.fetch_sub(1, std::sync::atomic::Ordering::Release);
-        return;
-    }
-    let look_again = start_one_queued();
-    PUMP.fetch_sub(1, std::sync::atomic::Ordering::Release);
-    // `start_one_queued` may have observed an empty queue just before a push.
-    if look_again && live_counter().load(std::sync::atomic::Ordering::Acquire) < max_live() && !queue().is_empty() {
-        on_slot_released();
+    loop {
+        if PUMP.swap(true, std::sync::atomic::Ordering::AcqRel) {
+            return;
+        }
+        start_one_queued();
+        PUMP.store(false, std::sync::atomic::Ordering::Release);
+        // A submission or slot release may have arrived while the pump was active.
+        if live_counter().load(std::sync::atomic::Ordering::Acquire) >= max_live() || queue().is_empty() {
+            return;
+        }
     }
 }
 
-/// `true` when the caller should check the queue again. `false` when a helper
-/// thread could not be created, so retrying would recurse.
-fn start_one_queued() -> bool {
+fn start_one_queued() {
     if !reserve_slot() {
-        return true;
+        return;
     }
     let Some(queued) = queue().pop_front() else {
         live_counter().fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
-        return true;
+        return;
     };
+    QUEUE_ROOM.notify_all();
     let shared = std::sync::Arc::new(std::sync::Mutex::new(Some(queued)));
     let for_thread = std::sync::Arc::clone(&shared);
-    let slot = Slot;
     match spawn_pipeline(move || {
-        let _slot = slot;
+        let _slot = Slot;
         let queued = take_job(&for_thread);
         let _watch = PipelineWatch::start(&queued.label);
         (queued.job)();
     }) {
-        Ok(handle) => {
-            drop(handle);
-            true
-        }
+        Ok(handle) => drop(handle),
         Err(error) => {
             crate::diagnostics::log(&format!("pipeline compile thread was not created: {error}"));
-            if let Some(queued) = shared.lock().unwrap_or_else(|error| error.into_inner()).take() {
-                queue().push_front(queued);
-            }
-            false
+            let _slot = Slot;
+            let queued = take_job(&shared);
+            // Detached failures settle their pending result through Delivery::drop.
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                run_logged(&queued.label, queued.job);
+            }));
         }
     }
 }

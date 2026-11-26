@@ -108,8 +108,19 @@ pub(super) enum Argument {
 }
 
 impl From<&GuestPipeline> for Pipeline {
+    /// Waits for a pipeline still compiling, which the title is now using.
     fn from(p: &GuestPipeline) -> Self {
-        Self::Regular(p.native.clone(), p.state.scene_root.clone(), p.state.reflected.clone(), p.state.raster_table.clone(), p.state.compute_threads, p.state.sampler_root.clone())
+        Self::Regular(p.bound_native(), p.state.scene_root.clone(), p.state.reflected.clone(), p.state.raster_table.clone(), p.state.compute_threads, p.state.sampler_root.clone())
+    }
+}
+
+impl Pipeline {
+    /// The native pipeline state this binding sets on a desktop command list.
+    pub(super) fn native(&self) -> Option<&ID3D12PipelineState> {
+        match self {
+            Self::Regular(native, ..) => Some(native),
+            Self::Ray(_) => None,
+        }
     }
 }
 
@@ -118,7 +129,7 @@ impl Bindings {
         Self {
             pipeline: initial.map(Pipeline::from),
             draw_trace: initial.and_then(|p| p.state.draw_trace.clone()),
-            null_usage: initial.and_then(|p| p.state.null_usage.clone()),
+            null_usage: initial.and_then(GuestPipeline::fallback_tag),
             ..Default::default()
         }
     }
