@@ -58,3 +58,46 @@ fn class5_mesh_pointer_is_eight_above_the_user_location() {
 fn class5_descriptor_load_uses_the_guest_heap_index() {
     assert_class5_descriptor_load();
 }
+
+#[test]
+fn sampler_heap_binding_uses_the_reaching_pointer() {
+    use tuxbox_dxbc::mesh_table::MeshTableBinding;
+
+    let words = [
+        0xbe99_0380u32, // s_mov_b32 s25, 0
+        0xbf82_0001, // s_branch past the write to s24
+        0xbe98_0380, // s_mov_b32 s24, 0
+        0xf408_050c, 0xfa00_0410, // s_load_dwordx4 s[20:23], s[24:25], 0x410
+        0xf40c_0808, 0xfa00_0000, // s_load_dwordx8 s[32:39], s[16:17], 0
+        0xf09c_0108, 0x00a8_0401, // image_sample_lz v4, v[1:2], s[32:39], s[20:23]
+        0xbf81_0000,
+    ];
+    let emit = |words: [u32; 10]| -> Result<String, String> {
+        let isa: Vec<_> = words.into_iter().flat_map(u32::to_le_bytes).collect();
+        let ex = heap_extract(&[[6, 0, 1, 0, 16]], 0x800, &isa);
+        let insns = disassemble(&isa);
+        let mut em = Emitter::new(&ex, insns.clone());
+        em.mesh_bindings = Some(super::mesh_bindings::MeshBindings {
+            tables: [((16, 0), MeshTableBinding {
+                parameter: 0, kind: 0, register: 1, space: 0, stride_words: None,
+            })].into(),
+            raw: Default::default(),
+            constants: Default::default(),
+            replacements: Default::default(),
+        });
+        em.resolve_resources()?;
+        em.emit_insn(5, &insns[5], false, None)?;
+        let mut hlsl = String::new();
+        em.heap_sampler_locals(&mut hlsl);
+        hlsl.push_str(&em.body);
+        Ok(hlsl)
+    };
+    let hlsl = emit(words).unwrap();
+    assert!(hlsl.contains("SamplerState samp65 = SamplerDescriptorHeap[65];"));
+    assert!(hlsl.contains(".SampleLevel(samp65,"));
+
+    let mut clobbered = words;
+    clobbered[1] = 0xbf84_0001; // s_cbranch_scc0: the write is now reachable
+    let reason = emit(clobbered).unwrap_err();
+    assert!(reason.contains("base s24 is not a root table pointer"));
+}

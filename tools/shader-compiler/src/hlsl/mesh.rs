@@ -157,13 +157,6 @@ pub(super) fn translate(
         em.resource_heap_base = Some(sgpr);
         em.compute_heap = true;
     }
-    if let Some(sgpr) = samplers.filter(|sgpr| {
-        bindings.as_ref().is_some_and(|mesh| !mesh.takes_sgpr(*sgpr))
-            && live.iter().any(|reg| reg == &format!("s{sgpr}"))
-    }) {
-        em.sampler_heap_base = Some(sgpr);
-        em.compute_heap = true;
-    }
     em.mesh_bindings = bindings;
     em.resolve_resources()?;
     em.resolve_structured_strides();

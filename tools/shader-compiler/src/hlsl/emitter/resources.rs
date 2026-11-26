@@ -15,6 +15,15 @@ impl<'a> Emitter<'a> {
         if n == 0 {
             return Ok(());
         }
+        if let Some(base) = mesh_sampler_heap_base(self.ex).filter(|&base| {
+            self.mesh_bindings.as_ref().is_some_and(|mesh| !mesh.takes_sgpr(base))
+                && self.insns.iter().any(|ins| ins.src.contains(&Opnd::Sgpr(base)))
+        }) {
+            // The first use can jump over a write in the instruction stream.
+            // Prove the pointer at each load using the reaching block state.
+            self.sampler_heap_base = Some(base);
+            self.compute_heap = true;
+        }
         let off2idx: HashMap<usize, usize> = self.insns.iter().enumerate().map(|(i, x)| (x.offset, i)).collect();
         // Block leaders and per-instruction branch targets.
         let mut leaders: BTreeSet<usize> = BTreeSet::new();
