@@ -93,7 +93,53 @@ pub(super) fn inputs(ex: &ShaderExtract, insns: &[Insn]) -> Vec<Param> {
     let mut fits: Vec<_> = [used.clone(), paired, all].into_iter().filter(|p| Some(p.len()) == count).collect();
     // The first of equals.
     fits.sort_by_key(|p| reads.iter().filter(|&&r| !carries(p, sig, r)).count());
-    fits.into_iter().next().unwrap_or(used)
+    if let Some(layout) = fits.into_iter().next() {
+        return layout;
+    }
+    // Without PS09 a clip distance can still take an exported parameter, even
+    // if the pixel stage never interpolates it. Only use the producer layout
+    // when the hardware count and every accessed component confirm it.
+    if ex.ps09_pixel_inputs.is_none() && sig.iter().any(|e| e.sysval == 2)
+        && reads.iter().any(|&r| rejects(&used, sig, r))
+    {
+        let exported = assign(sig, &ex.flat_inputs, |e| matches!(e.sysval, 0 | 2));
+        if Some(exported.len()) == count && reads.iter().all(|&r| declared(&exported, sig, r)) {
+            // Dropping unused rows before packing can retain the same parameter
+            // count while moving the halves. The observed components must decide.
+            let compact = assign(sig, &ex.flat_inputs, |e| e.sysval == 2 || e.sysval == 0 && read(e.register));
+            if compact.len() != exported.len() || !reads.iter().all(|&r| declared(&compact, sig, r))
+                || reads.iter().all(|&r| component(&compact, r) == component(&exported, r))
+            {
+                return exported;
+            }
+        }
+    }
+    used
+}
+
+type Read = (usize, usize, Option<bool>);
+
+fn component(params: &[Param], (attr, channel, half): Read) -> Option<(u32, usize)> {
+    match (params.get(attr)?, half) {
+        (Param::Full(reg), _) => Some((*reg, channel)),
+        (packed @ Param::Half(_), Some(high)) => packed.component(channel, high),
+        _ => None,
+    }
+}
+
+/// Match actual emitter rejections. VINTRP supplies the default channel of
+/// an existing full parameter, so that case must keep the existing layout.
+fn rejects(params: &[Param], sig: &[SigElement], r: Read) -> bool {
+    let Some((reg, ch)) = component(params, r) else { return true };
+    r.2.is_some() && !sig.iter().any(|e| e.sysval == 0 && e.register == reg && e.mask >> ch & 1 != 0
+        && !matches!(e.comp_type, 1 | 2))
+}
+
+fn declared(params: &[Param], sig: &[SigElement], r: Read) -> bool {
+    let Some((reg, ch)) = component(params, r) else { return false };
+    let half = r.2.is_some();
+    matches!(params[r.0], Param::Half(_)) == half && sig.iter().any(|e|
+        e.sysval == 0 && e.register == reg && e.mask & e.rw_mask & (1 << ch) != 0)
 }
 
 /// Parameter, channel and half (`None` for the whole channel) of each interpolation.
@@ -110,15 +156,7 @@ fn reads(insns: &[Insn]) -> BTreeSet<(usize, usize, Option<bool>)> {
 
 /// Whether `params` carries a component the program declares it reads there.
 fn carries(params: &[Param], sig: &[SigElement], (attr, channel, half): (usize, usize, Option<bool>)) -> bool {
-    let Some(param) = params.get(attr) else { return false };
-    let (register, component) = match (param, half) {
-        (Param::Full(register), _) => (*register, channel),
-        (Param::Half(_), None) => return false,
-        (Param::Half(_), Some(high)) => match param.component(channel, high) {
-            Some(found) => found,
-            None => return false,
-        },
-    };
+    let Some((register, component)) = component(params, (attr, channel, half)) else { return false };
     sig.iter().any(|e| e.register == register && e.rw_mask >> component & 1 != 0)
 }
 

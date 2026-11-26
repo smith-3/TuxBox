@@ -1,6 +1,66 @@
 use super::*;
 
 #[test]
+fn interpolated_half_after_clip_uses_declared_signature_component() {
+    let mut ex = pixel_wave_test_extract();
+    let sig = |name: &str, sysval, comp_type, register, mask, rw_mask| crate::meta::SigElement {
+        name: name.into(), index: 0, sysval, comp_type, register, mask, rw_mask,
+    };
+    ex.input_sig = vec![
+        sig("SV_ClipDistance", 2, 3, 0, 15, 0),
+        sig("SV_Position", 1, 3, 1, 15, 0),
+        sig("COLOR", 0, 6, 2, 15, 8),
+        sig("TEXCOORD", 0, 1, 3, 1, 0),
+    ];
+    ex.flat_inputs = vec![3];
+    ex.fssm.resize(0x23c, 0);
+    ex.fssm[0x238] = 3;
+    // v_interp_p1ll_f16 v4, v0, attr1.y high: component W of COLOR0.
+    let words = [0xd742_0004u32, 0x0002_0141];
+    let isa: Vec<u8> = words.into_iter().flat_map(u32::to_le_bytes).collect();
+    let insns = crate::rdna2::disassemble(&isa);
+    let selected = |ex: &ShaderExtract| params::inputs(ex, &insns).get(1).and_then(|p| p.component(1, true));
+    assert_eq!(selected(&ex), Some((2, 3)));
+    ex.input_sig[2].rw_mask = 4;
+    assert_eq!(selected(&ex), None, "the program did not declare W as a read");
+    ex.input_sig[2].rw_mask = 8;
+    ex.fssm[0x238] = 4;
+    assert_eq!(selected(&ex), None, "hardware count does not match the producer");
+
+    // Keeping an unread half before COLOR makes attr1.y high select Y;
+    // dropping it selects W. Both are declared, so the count cannot decide.
+    ex.input_sig = vec![
+        sig("SV_ClipDistance", 2, 3, 0, 15, 0),
+        sig("TEXCOORD", 0, 6, 1, 1, 0),
+        sig("COLOR", 0, 6, 2, 15, 10),
+    ];
+    ex.fssm[0x238] = 2;
+    assert_eq!(selected(&ex), None, "two valid layouts select different components");
+}
+
+#[test]
+fn full_interpolant_after_an_unused_input_keeps_its_exported_slot() {
+    let mut ex = pixel_wave_test_extract();
+    let sig = |name: &str, sysval, register, read| crate::meta::SigElement {
+        name: name.into(), index: 0, sysval, comp_type: 3, register, mask: 15, rw_mask: read,
+    };
+    ex.input_sig = vec![
+        sig("TEXCOORD", 0, 0, 0), sig("COLOR", 0, 1, 4),
+        sig("SV_ClipDistance", 2, 2, 0),
+    ];
+    ex.fssm.resize(0x23c, 0);
+    ex.fssm[0x238] = 3;
+    // gfx1030 v_interp_p1_f32 v2, v0, attr1.z.
+    let insns = crate::rdna2::disassemble(&0xc808_0600u32.to_le_bytes());
+    assert_eq!((insns[0].aux.imm, insns[0].aux.imm2), (1, 2));
+    let layout = params::inputs(&ex, &insns);
+    assert!(matches!(layout.get(1), Some(params::Param::Full(1))));
+    assert_eq!(sig_lookup(&ex.input_sig, 1, 2), Some((1, 2)));
+    ex.input_sig[1].rw_mask = 2;
+    assert_eq!(params::inputs(&ex, &insns).len(), 1);
+}
+
+#[test]
 fn vector_add_sub_can_discard_the_carry_destination() {
     use super::float64::tests::translate;
 
