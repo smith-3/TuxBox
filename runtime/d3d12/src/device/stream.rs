@@ -518,6 +518,7 @@ unsafe fn create(
             },
             (None, None) => None,
         };
+        let late = compute::LateFailure::default();
         match compute::large_deferred(
             &label,
             device.native.clone(),
@@ -525,6 +526,7 @@ unsafe fn create(
             code.clone(),
             node_mask,
             D3D12_PIPELINE_STATE_FLAG_NONE,
+            late.clone(),
         ) {
             crate::big_stack::PipelineWait::Ready(result) => result,
             crate::big_stack::PipelineWait::Deferred(pending) => {
@@ -538,6 +540,7 @@ unsafe fn create(
                     null_pipeline(host, &native_desc, &fields, stream_output, geometry_record, pipeline, &hashes)
                 } {
                     Some(Ok(stand_in)) => {
+                        late.deferred(&label);
                         // Command lists bind the compiled pipeline, so this is no null use.
                         pipeline.null_usage = None;
                         pipeline.pending = Some(pending);

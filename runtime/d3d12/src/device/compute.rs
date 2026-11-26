@@ -355,7 +355,9 @@ unsafe fn create_pipeline_x_inner(
     let retry = (translation.is_some() && reflected.is_none() && scene_root.is_none()).then(|| bytes.to_vec());
     let trace_source = crate::commands::queue_trace::enabled().then(|| compute_source_kind(bytes));
     let attempt = if translation.is_some() { "translated" } else { "original" };
+    let late = LateFailure::default();
     let compile = {
+        let late = late.clone();
         let device = this.native.clone();
         let signature = signature.clone();
         let shader = code.to_vec();
@@ -369,16 +371,18 @@ unsafe fn create_pipeline_x_inner(
             let _slot = crate::compile_gate::large_compile(shader.len(), |slots| {
                 crate::diagnostics::log(&format!("{name} waits for one of {slots} large compile slots"));
             });
-            let result = owned_compile(device.clone(), signature.clone(), shader, node_mask, flags);
+            let mut result = owned_compile(device.clone(), signature.clone(), shader, node_mask, flags);
             if let Some(source) = trace_source {
                 trace_compile_failure(&name, attempt, source, &result);
             }
             if let (Err(_), Some(original)) = (&result, retry) {
-                let result = owned_compile(device, signature, original, node_mask, flags);
+                result = owned_compile(device, signature, original, node_mask, flags);
                 if let Some(source) = trace_source {
                     trace_compile_failure(&name, "original-retry", source, &result);
                 }
-                return result;
+            }
+            if let Err(error) = &result {
+                late.failed(&name, error.code().0);
             }
             result
         }
@@ -391,7 +395,10 @@ unsafe fn create_pipeline_x_inner(
     let (native, pending) = match crate::big_stack::run_deadline(&label, compile) {
         crate::big_stack::PipelineWait::Ready(result) => (result, None),
         crate::big_stack::PipelineWait::Deferred(pending) => match null_native(this, signature.as_ref(), desc) {
-            Some(stand_in) => (Ok(stand_in), Some(pending)),
+            Some(stand_in) => {
+                late.deferred(&label);
+                (Ok(stand_in), Some(pending))
+            }
             // Without a stand-in the title waits now, as it did before deferral.
             None => (pending.wait().unwrap_or_else(|| Err(E_NOTIMPL.into())), None),
         },
@@ -439,6 +446,7 @@ pub(super) fn large_deferred(
     shader: Vec<u8>,
     node_mask: u32,
     flags: D3D12_PIPELINE_STATE_FLAGS,
+    late: LateFailure,
 ) -> crate::big_stack::PipelineWait<windows::core::Result<ID3D12PipelineState>> {
     let name = label.to_owned();
     crate::big_stack::run_deadline(label, move || {
@@ -449,8 +457,70 @@ pub(super) fn large_deferred(
         if crate::commands::queue_trace::enabled() {
             trace_compile_failure(&name, "translated-stream", "-", &result);
         }
+        if let Err(error) = &result {
+            late.failed(&name, error.code().0);
+        }
         result
     })
+}
+
+/// Reports a compile that fails after creation returned its stand-in. A failure
+/// the creating thread waited for is reported on its own path instead.
+#[derive(Clone, Default)]
+pub(super) struct LateFailure(std::sync::Arc<std::sync::Mutex<Late>>);
+
+#[derive(Default)]
+enum Late {
+    #[default]
+    Undecided,
+    Deferred,
+    Failed(i32),
+}
+
+impl LateFailure {
+    /// From the compile, once its last attempt has failed.
+    fn failed(&self, label: &str, status: i32) {
+        if let Some(status) = self.settle_failure(status) {
+            report_late_failure(label, status);
+        }
+    }
+
+    /// From the creating thread, when it returns a stand-in before the compile ends.
+    pub(super) fn deferred(&self, label: &str) {
+        if let Some(status) = self.settle_deferred() {
+            report_late_failure(label, status);
+        }
+    }
+
+    /// The failure to report now, if creation already returned.
+    fn settle_failure(&self, status: i32) -> Option<i32> {
+        let mut late = self.0.lock().unwrap_or_else(|error| error.into_inner());
+        match *late {
+            Late::Deferred => Some(status),
+            _ => {
+                *late = Late::Failed(status);
+                None
+            }
+        }
+    }
+
+    /// A failure that arrived while creation was still deciding, to report now.
+    fn settle_deferred(&self) -> Option<i32> {
+        let mut late = self.0.lock().unwrap_or_else(|error| error.into_inner());
+        let failed = match *late {
+            Late::Failed(status) => Some(status),
+            _ => None,
+        };
+        *late = Late::Deferred;
+        failed
+    }
+}
+
+fn report_late_failure(label: &str, status: i32) {
+    crate::progress::stand_in();
+    crate::diagnostics::log(&format!(
+        "{label} driver compile failed after creation: {status:#010x}; command lists keep its stand-in"
+    ));
 }
 
 fn compute_source_kind(bytes: &[u8]) -> &'static str {

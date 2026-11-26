@@ -28,3 +28,19 @@ fn only_a_64_lane_program_on_a_32_lane_host_is_translated_again() {
     // The translation runs waves of 32, so a host limited below that cannot use it.
     assert!(!needs_narrow_waves(Some((64, 64)), (16, 16)));
 }
+
+#[test]
+fn a_failed_compile_is_reported_late_only_once_creation_returned() {
+    const FAILED: i32 = 0x8007_000e_u32 as i32;
+    // The creating thread waited and saw the failure itself.
+    let waited = LateFailure::default();
+    assert_eq!(waited.settle_failure(FAILED), None);
+    // The compile failed after the stand-in was returned.
+    let after = LateFailure::default();
+    assert_eq!(after.settle_deferred(), None);
+    assert_eq!(after.settle_failure(FAILED), Some(FAILED));
+    // The compile failed while creation was deciding to return a stand-in.
+    let between = LateFailure::default();
+    assert_eq!(between.settle_failure(FAILED), None);
+    assert_eq!(between.settle_deferred(), Some(FAILED));
+}
